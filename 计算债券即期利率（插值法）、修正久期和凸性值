@@ -1,0 +1,139 @@
+# -*- coding: utf-8 -*-
+
+# 2023年3月，国家开发银行发行了210亿元的“23国开05”债券（代码230205.IB），该债券面值100元，期限为10年，票面利率3.02%，每年付息1次，起息日为2023年3月6日，到期日为2033年3月6日。
+用python完成：
+#%% 1、请登录“中国外汇交易中心暨全国银行间同业拆借中心”的官方网站“中国货币网”，查找“基准利率”中的“实时收益率曲线”，下载“政策性金融债”的实时收益率数据，下载并用python读入这些数据，并利用数据作图将其可视化。
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pylab import mpl
+mpl.rcParams['font.sans-serif'] = ['SimHei']
+mpl.rcParams['axes.unicode_minus'] = False
+benchmark = pd.read_excel('D:\Python\Python金融数据分析\政策性金融债实时收益率20230518.xlsx',sheet_name="sheet1",header=0,index_col=0) #导入外部数据
+benchmark.columns = ['bonds','maturity','ret_bid','ret_ask']
+benchmark['yields'] = benchmark[['ret_bid','ret_ask']].mean(1)
+
+plt.figure(figsize=(8,6))
+plt.plot(benchmark['maturity'],benchmark['yields'],'b')
+plt.xlabel('到期时间（年）',fontsize =13)
+plt.ylabel('收益率（%）',fontsize =13,rotation=90)
+plt.xticks(fontsize=13,rotation=0)
+plt.yticks(fontsize=13)
+plt.title('政策性金融债基准利率',fontsize=13)
+plt.grid('True')
+plt.show()
+
+
+#%% 2、计算“23国开05”各个未来现金流的剩余期限，利用插值法得到这些时刻对应的即期利率（即零息债券的收益率）。然后，再利用这些零息利率对“23国开05”债券进行精确定价。
+maturity=benchmark['maturity'].values
+yields = benchmark['yields'].values
+import scipy.interpolate as si     
+func =si.interp1d(maturity,yields,kind='quadratic')    #运用原有的数据构建一个插值函数，并运用2阶样条曲线插值法
+
+import datetime as dt                        #导入datatime模块
+maturity_new = pd.DataFrame([],index=range(2024,2034),columns=['maturity'])
+for i in range(2024,2034):
+    days_delta = dt.datetime(year=i, month=3, day=6) - dt.datetime.now()
+    maturity_new.loc[i,'maturity'] = days_delta.days/365  # 这里面是到期时间
+maturity_new = maturity_new['maturity'].values
+maturity_new = maturity_new.astype(np.float64)  # 观察到这里的数据类型不对
+yields_new =func(maturity_new)               #计算得到基于插值法的零息利率
+
+plt.figure(figsize=(8,6))
+plt.plot(maturity_new ,yields_new ,'b')
+plt.plot(maturity_new ,yields_new ,'ro')
+plt.plot(maturity ,yields ,'y*')
+plt.xlabel('到期时间（年）',fontsize =13)
+plt.ylabel('收益率（%）',fontsize =13,rotation=90)
+plt.xticks(fontsize=13,rotation=0)
+plt.yticks(fontsize=13)
+plt.title('政策性金融债基准利率(拟合数据)',fontsize=13)
+plt.grid('True')
+plt.show()
+
+def Bond_value2(c,t,y):
+    '''构建基于不同期限零息利率作为贴现率计算债券价格的函数
+    c：表示债券存续期内现金流，用数组的数据结构输入；
+    t：表示对应于产生现金流的时刻或期限，用数组的数据结构输入；
+    y：表示不同期限的零息利率，用数组的数据结构输入。'''
+    import numpy as np
+    cashflow=[]                               #生成存放每期现金流现值的初始数列
+    for i in np.arange(len(c)):
+        cashflow.append(c[i]*np.exp(-y[i]*t[i])) #计算每期现金流现值并放入列表
+    return np.sum(cashflow)
+
+bond_cash_flow = np.ones_like(maturity_new)*100*0.0302          #生成存放债券票息的数组
+bond_cash_flow[-1]=100*(1+0.0302)                      #将债券本金和最后一期票息加入数组
+
+bond_price = Bond_value2(c=bond_cash_flow,t=maturity_new,y=yields_new/100)   #输入债券的相关信息
+print('计算得到的债券估值净价是：',round(bond_price,4))
+
+
+#%% 3、利用前面得到的数据计算该债券的修正久期和凸性值；假定即期利率曲线（零息利率曲线）发生了平移，即每期都降低50个基点，请用久期和凸性方法重新估计债券价格。
+# 首先要利用价格得到到期收益率备用：
+def YTM(C,M,T,m,P):
+    '''构建计算债券到期收益率（连续复利）的函数
+    C：债券的票面利率；
+    M：债券的本金；
+    T：债券的期限，用年表示；
+    m：债券票面利率每年的支付频次；
+    y：债券的市场价格。'''
+    import scipy.optimize as so               #导入SciPy的子模块optimize
+    import numpy as np 
+    def f(y):
+        coupon=[]                                 #建立一个初始的存放每一期票息现值的列表
+        for i in np.arange(1,T*m+1):
+            coupon.append(np.exp(-y*i/m)*M*C/m)  #计算每一期债券票息的现值并放入列表
+        return np.sum(coupon)+np.exp(-y*T)*M-P  #相当于输出一个等于零的式子
+    return so.fsolve(f,0.1)
+
+ytm = YTM(C=0.0302,M=100,T=maturity_new[-1],m=1,P=bond_price) #得到的结果是一个列表
+print('计算得到债券的到期收益率',np.round(ytm,6))
+
+# 下面计算修正久期：
+def Modi_Duration(c,y,m,t):
+    '''构建一个计算修正久期的函数
+    c：表示债券存续期内现金流，用数组（ndarray）的数据结构输入；
+    y：表示债券的到期收益率，复利频次是m次；
+    m：表示复利频次；
+    t：表示对应于产生现金流的时刻，用数组的数据结构输入。'''
+    cashflow=[]      #建立存放债券每一期现金流现值的列表
+    weight=[]        #建立存放在债券每一期现金流现值与债券价格比率的列表
+    n = len(t)
+    Rc=m*np.log(1+y/m)      #计算对应的连续复利的债券到期收益率
+    for i in np.arange(n):
+        cashflow.append(c[i]*np.exp(-Rc*t[i]))   #计算得到债券每一期现金流现值的列表
+    for i in np.arange(n):
+        weight.append(cashflow[i]/sum(cashflow))  #计算得到每一期现金流现值与债券价格比率的列表
+    duration=np.sum(t*weight)  #计算得到债券麦考利久期
+    return duration/(1+y/m)            #输出债券的修正久期
+
+modified_duration=Modi_Duration(c=bond_cash_flow,y=ytm[0],m=1,t=maturity_new)     #计算债券修正久期
+print('23国开05债券的修正久期',round(modified_duration,4))
+
+def Convexity(c,y,t):
+    '''构建一个计算债券凸性的函数
+    c：表示债券存续期内现金流，用数组（ndarray）的数据结构输入；
+    y：表示债券的到期收益率（连续复利）；
+    t：表示对应于产生现金流的时刻，用数组的数据结构输入。'''
+    cashflow=[]      #建立存放债券每一期现金流现值的列表
+    weight=[]        #建立存放在债券每一期现金流现值与债券价格比率的列表
+    n = len(t)
+    for i in np.arange(n):
+        cashflow.append(c[i]*np.exp(-y*t[i]))   #计算债券每一期现金流现值的列表
+    bond_price=sum(cashflow)
+    for i in np.arange(n):
+        weight.append(cashflow[i]/bond_price)  #计算每一期现金流现值与债券价格比率的列表
+    convexity=np.sum(weight*t**2)        #计算得到债券凸性
+    return convexity          #输出债券的凸性
+
+conv = Convexity(c=bond_cash_flow,y=ytm[0],t=maturity_new)  #输入债券要素
+print('23国开05债券的凸性',round(conv,4))
+
+# 债券价格的变化金额:
+delta_price = -bond_price*modified_duration*(-0.005)+0.5*bond_price*conv*(-0.005)**2
+# 债券价格上升至:
+print('23国开05债券的价格会变成：',round(bond_price+delta_price,4))
+
+
+
