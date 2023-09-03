@@ -1,0 +1,1770 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun May 28 20:03:31 2023
+
+@author: gulining
+"""
+import pandas as pd
+import numpy as np
+import datetime as dt
+from datetime import timedelta
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter # 设定x/y轴datetime显示格式
+import matplotlib.ticker as ticker # 修改x轴标签过于密集的问题
+import scipy.optimize as sco # 最优化
+from scipy import stats
+plt.rcParams['font.sans-serif'] = ['SimHei']  #设置中文黑体显示
+plt.rcParams['axes.unicode_minus'] = False    #设置符号正确显示
+import os
+import math
+#%%
+"""定义模块"""
+class Performance:
+    def __init__(self,sr_netvalue:np.ndarray,sr_pred=False):
+        """
+        输入：资产/净值 Series
+        输出：表现
+        """
+        self.sr_netvalue = sr_netvalue
+        """收益率"""
+        self.annualized_returns = round((self.sr_netvalue/self.sr_netvalue.shift(1)-1).mean()*242,5)
+        """波动率水平"""
+        self.annualized_volatility = round((self.sr_netvalue/self.sr_netvalue.shift(1)-1).std()*np.sqrt(242),4)
+        """最大回撤"""
+        self.mdd = 0
+        peak = self.sr_netvalue[0]
+        for x in np.array(self.sr_netvalue):
+            if x > peak:
+                peak = x    
+            dd = (peak - x) / peak
+            if dd > self.mdd:
+                self.mdd = dd      
+    def cal_sharp(self):
+        """年化夏普比率"""
+        return round((self.annualized_returns-0.02)/ self.annualized_volatility,4)
+    def max_drawdown(self):
+        """最大回撤"""
+        return round(self.mdd,4) 
+    def cal_calmar(self):
+        """年化卡玛比率"""
+        return round((self.annualized_returns-0.02)/self.mdd,4)
+    def accumulate_net_value(self):
+        """累计净值"""
+        return round(self.sr_netvalue[-1],4)
+
+def risk_budgeting(cov,b=np.array([0.98,0.02])):
+    """构建风险预算模型
+    input：协方差cov
+    output：各资产权重w
+    """
+    def f(w):
+        w = np.array(w)
+        std = np.sqrt(np.dot(w.T,np.dot(cov,w))) # 组合风险
+        MRC = np.dot(cov, w) / std # 资产对整个资产组合的边际风险贡献
+        TRC = w * MRC # 资产对整个组合的风险贡献
+        delta_TRC = 0
+        for i in range(len(b)):
+            for j in range(len(b)):
+                delta_TRC += (TRC[i]/b[i] - TRC[j]/b[j])**2
+        return delta_TRC
+    x0 = np.ones(cov.shape[0])/cov.shape[0]
+    cons = ({'type':'eq','fun':lambda w:np.sum(w)-1})
+    bnds = tuple((0,1) for x in x0)
+    options={'disp':False, 'maxiter':1000, 'ftol':1e-20}
+    result = sco.minimize(f, x0, method="SLSQP", 
+                          bounds=bnds, constraints=cons,options=options)
+    return result.x
+
+def get_last_day(start_year,end_year):
+    """获取时间范围内每个月的最后一天并格式化成'yyyy-mm-dd'的datetime格式
+    input：start_year,end_year，格式如‘2022’，前闭后开，不包括end_year当年
+    output：datetime格式的每个月最后一天
+    """
+    import calendar
+    daliy = []
+    for years in range(start_year,end_year):
+        for month in range(1,13):
+            cal = calendar.month(years,month)
+            day = int(cal[-3:])
+            daliy.append((years,month,day))
+    date = []
+    for i in daliy:
+        y = str(i[0])
+        if i[1] < 10:
+            m = str('0'+str(i[1]))
+        else:
+            m = str(i[1])
+        if i[2] < 10:
+            d = str('0'+str(i[2]))
+        else:
+            d = str(i[2])
+        date.append(pd.to_datetime(y+'-'+m+'-'+d,format='%Y-%m-%d'))
+    return date
+
+class Statistic_data():
+    """表现指标
+    position:信号周期resize_list
+    signal:建仓周期
+    position_change:持仓涨跌幅
+        """
+    def __init__(self,position:np.ndarray,signal:np.ndarray,position_change):
+        self.position = position
+        self.signal = signal
+        self.position_change = position_change.dropna()
+        self.position_change_df = pd.DataFrame(self.position_change)
+        self.position_change_df['yyyymm'] = self.position_change_df.index.strftime('%Y-%m')
+        self.r_temp = self.position_change_df.groupby('yyyymm').apply(lambda x: (1+x).cumprod())
+        self.r_temp['yyyymm'] = self.r_temp.index.strftime('%Y-%m')
+        self.r_temp_ = self.r_temp.groupby('yyyymm').last()
+        self.sr_netvalue = self.r_temp
+    def sum_period(self):
+        return len(self.position) # 合计周期
+    
+    def sum_signal(self):
+        return len(self.signal[(self.signal ==1)|(self.signal ==-1)]) # 信号次数
+    def sum_long_signal(self):
+        return len(self.signal[self.signal == 1]) # 多头
+    def sum_short_signal(self):
+        return len(self.signal[self.signal == -1]) # 空头
+    def win_rate(self):
+        # 胜率
+        return round(len(self.r_temp_[self.r_temp_ > 1].dropna()) / len(self.r_temp_.dropna()),2) 
+        # return round(len(self.position_change[self.position_change > 0])/len(self.position_change), 2) # 胜率
+    def profi_loss_ratio(self):
+        # 盈亏比
+        # 找出调仓日——每月最后一个交易日
+        """盈亏比"""
+        # p   = self.position_change[self.position_change>0].sum()/(self.position_change>0).sum() # 正收益每日平均值
+        # c   = abs(self.position_change[self.position_change<0].sum()/(self.position_change<0).sum()) # 负收益每日平均值
+        # ratio = p/c
+        # return ratio
+        return round(len(self.r_temp_[self.r_temp_ > 1].dropna()) / len(self.r_temp_[self.r_temp_ < 1].dropna()),2) 
+        # 交易获利次数占总次数的百分比
+    def expectation(self):
+        # 期望=平均盈利×胜率－平均亏损×（1－胜率）
+        # 期望 = 盈亏比*胜率- 1*（1-胜率）
+        return round(self.profi_loss_ratio() * self.win_rate() -(1-self.win_rate()),2)#position_change > 0])/len(self.position_change[self.position_change < 0]), 2)  # 期望   
+def drawdown(cum_returns):
+    """ input:累计收益率/净值序列
+        output:回撤序列
+    """
+    # 计算历史峰值
+    historical_peak = cum_returns.cummax()
+    # 计算每天的回撤
+    drawdown = (cum_returns - historical_peak) / historical_peak
+    return drawdown    
+def signal_count_net_value_au(daily_return_df,N,name,name_basis='TIPS收益率',name_target='上海黄金现货每日涨跌幅'):
+    """
+    -------计算美债实际收益率均线信号择时效果
+    input:
+        daily_return_df:包括回测指标和标的收益
+        N = N日均线
+        name = '多空' ——指标命名
+        name = '多空'/‘纯多头'/'纯空头'
+        name_basis = 'TIPS收益率'——回测指标
+        name_target = '上海黄金现货每日涨跌幅'——标的收益
+    output:
+        resize_list_au————合计周期——series
+        daily_return[[name+'建仓te',name+'持仓涨跌幅',name+'持仓净值']]————信号次数、持仓涨跌幅、持仓净值——df
+    """
+    daily_return = daily_return_df.dropna().copy()
+    if N == 1:
+        # 找出调仓日——每月最后一个交易日
+        daily_return['date'] = daily_return.index
+        daily_return['yyyymm'] = daily_return.index.strftime('%Y-%m')
+        resize_list_au = daily_return.groupby(daily_return['yyyymm']).last()['date']
+        if name =='纯多头':
+            daily_return[name+'持仓涨跌幅'] = daily_return[name_target]
+            for i in resize_list_au:
+                daily_return.loc[i,name+'建仓te'] = 1
+        elif name =='纯空头':
+            daily_return[name+'持仓涨跌幅'] = - daily_return[name_target]
+            for i in resize_list_au:
+                daily_return.loc[i,name+'建仓te'] = -1
+        else:
+            print('error！')
+        daily_return[name+'持仓净值'] = (1+ daily_return[name+'持仓涨跌幅']).cumprod()
+        daily_return[name+'持仓净值'] = daily_return[name+'持仓净值'].fillna(method='ffill')
+    else:
+        daily_return[name_basis+'_N='+str(N)] = daily_return[name_basis].rolling(window=N).mean()
+        # 构建信号
+        condition1 = daily_return[name_basis] > daily_return[name_basis+'_N='+ str(N)]
+        condition2 = daily_return[name_basis] < daily_return[name_basis+'_N='+ str(N)]
+        daily_return.loc[condition1,name+'signal'] = -1
+        daily_return.loc[condition2,name+'signal'] = 1
+        # 找出调仓日——每月最后一个交易日
+        daily_return['date'] = daily_return.index
+        daily_return['yyyymm'] = daily_return.index.strftime('%Y-%m')
+        resize_list_au = daily_return.groupby(daily_return['yyyymm']).last()['date']
+        for i in resize_list_au:
+            if name == '多空':
+                if daily_return.loc[i,name+'signal'] == 1:
+                    daily_return.loc[i,name+'建仓te'] = 1
+                elif daily_return.loc[i,name+'signal'] == -1:
+                    daily_return.loc[i,name+'建仓te'] = -1
+                else:
+                    daily_return.loc[i,name+'建仓te'] = 0
+            elif name == '纯多头':
+                if daily_return.loc[i,name+'signal'] == 1:
+                    daily_return.loc[i,name+'建仓te'] = 1
+                else:
+                    daily_return.loc[i,name+'建仓te'] = 0
+            elif name == '纯空头':
+                if daily_return.loc[i,name+'signal'] == -1:
+                    daily_return.loc[i,name+'建仓te'] = -1
+                else:
+                    daily_return.loc[i,name+'建仓te'] = 0
+            else:
+                print('参数name设置错误，请调整。')
+        daily_return[name+'建仓'] = daily_return[name+'建仓te'].shift(1)
+        daily_return[name+'建仓'] = daily_return[name+'建仓'].fillna(method='ffill')
+        condition1 = daily_return[name+'建仓'] == 1
+        condition2 = daily_return[name+'建仓'] == -1
+        daily_return.loc[condition1,name+'持仓'] = 1
+        daily_return.loc[condition2,name+'持仓'] = -1
+        daily_return[name+'持仓涨跌幅'] = daily_return[name+'持仓'] * daily_return[name_target]
+        daily_return[name+'持仓净值'] = 1 + daily_return[name+'持仓涨跌幅']
+        daily_return[name+'持仓净值'] = daily_return[name+'持仓净值'].cumprod()
+        daily_return[name+'持仓净值'] = daily_return[name+'持仓净值'].fillna(method='ffill')
+    return resize_list_au,daily_return[[name+'建仓te',name+'持仓涨跌幅',name+'持仓净值']]
+#%%
+# 文件路径————需要修改成相应的文件路径
+os.chdir('/Users/gulining/Downloads/研究生-/课程资料/研一下/（研）Python与金融数据分析（22-23-2）/期末考核/')
+# 创建文件夹_存储输出的图片、表格
+try:
+    os.mkdir('./output')
+except:
+    pass
+#%%
+"""由于研报没有说明具体的数据设定，如后复权/前复权/不复权；再如普通指数/全收益指数；也没有指出具体的调仓规则/加减仓规则，相应部分是按笔者个人理解进行设计，和研报中的结果可能会有出入"""
+# 导入数据 
+# 中证800指数(sh000906) 全收益指数
+# index_800 = pd.read_excel(r'./数据/800收益后复权.xlsx',sheet_name='Sheet1',index_col=0,header=3)
+index_800 = pd.read_excel(r'./数据/800收益不复权.xlsx',sheet_name='不复权',index_col=0,header=3)
+index_800.index = pd.to_datetime(index_800.index)
+# 中债综合指数M0051552
+index_bond = pd.read_excel(r'./数据/中债综合总财富指数.xlsx',sheet_name='Sheet1',index_col=0,header=3)#,encoding='gbk'
+index_bond.index = pd.to_datetime(index_bond.index)
+index_bond.rename(columns={'CBA00201.CS':'bond'},inplace=True)
+# 上海金交所黄金现货_收盘价_Au9999
+# au9999 = pd.read_csv(r'./数据/上海金交所黄金现货_收盘价_Au9999.csv')#,encoding='gbk'
+au9999 = pd.read_excel(r'./数据/AU9999.SGE.xlsx',sheet_name='Sheet1',index_col=0,header=3)
+au9999.index = pd.to_datetime(au9999.index)
+au9999.rename(columns={'close':'Au'},inplace=True)
+au9999['上海黄金现货每日涨跌幅'] = au9999['Au'].pct_change()
+au9999['上海黄金现货'] = au9999['上海黄金现货每日涨跌幅'] + 1
+au9999['上海黄金现货'].iloc[0] = 1
+au9999['上海黄金现货'] = au9999['上海黄金现货'].cumprod()
+#%%
+"""
+1引言 6 
+2资产的选择
+2.1 全球资产的相关性.
+2.2 股债金业绩表现..... 8 
+    图3：三类资产的历史净值曲线（2005.1.4-2023.8.30）
+    表2：三类资产历史表现（2005.1.4-2023.8.30）
+    表3：各类资产历年风险收益情况（2005.1.4-2023.8.30）
+"""
+# 图3：三类资产的历史净值曲线
+net_value_800 = index_800['close']
+net_value_800 = pd.DataFrame(net_value_800)
+# 中证800
+net_value_800['中证800每日涨跌幅'] = net_value_800['close'].pct_change()
+net_value_800['中证800'] = net_value_800['中证800每日涨跌幅'] + 1
+net_value_800['中证800'].iloc[0] = 1
+net_value_800['中证800'] = net_value_800['中证800'].cumprod()
+# 中债综合指数M0051552
+net_value_bond = index_bond
+net_value_bond['中债综合总财富指数每日涨跌幅'] = net_value_bond['bond'].pct_change()
+net_value_bond['中债综合总财富指数'] = net_value_bond['中债综合总财富指数每日涨跌幅'] + 1
+net_value_bond['中债综合总财富指数'].iloc[0] = 1
+net_value_bond['中债综合总财富指数'] = net_value_bond['中债综合总财富指数'].cumprod()
+# 上海金交所黄金现货_收盘价_Au9999
+net_value_au9999 = au9999.loc['2005-01-04':,:]
+# net_value_au9999['上海黄金现货每日涨跌幅'] = net_value_au9999['Au'].pct_change()
+# net_value_au9999['上海黄金现货'] = net_value_au9999['上海黄金现货每日涨跌幅'] + 1
+# net_value_au9999['上海黄金现货'].iloc[0] = 1
+# net_value_au9999['上海黄金现货'] = net_value_au9999['上海黄金现货'].cumprod()
+# 等权重
+equal_net_value = pd.DataFrame()
+equal_net_value = pd.concat([net_value_800,net_value_bond,net_value_au9999],axis=1)
+equal_net_value['等权重'] = ( equal_net_value['中证800'] + equal_net_value['中债综合总财富指数'] + equal_net_value['上海黄金现货'] ) / 3
+equal_net_value['等权重每日涨跌幅'] = equal_net_value['等权重']/equal_net_value['等权重'].shift(1) - 1
+equal_net_value['等权重每日涨跌幅'][0] = (net_value_800['中证800每日涨跌幅'][0] + 
+                                net_value_bond['中债综合总财富指数每日涨跌幅'][0] + 
+                                net_value_au9999['上海黄金现货每日涨跌幅'][0]) / 3
+equal_net_value = equal_net_value.loc['2005-01-04':,:]
+#%%
+# 绘制图3：三类资产的历史净值曲线
+fig,ax =plt.subplots(figsize=(10,6))
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.plot(equal_net_value['上海黄金现货'],c=[0.1,0.2,0.8],label=u'上海黄金现货',lw=2.5)
+plt.plot(equal_net_value['中债综合总财富指数'],c=[0.0,0.8,1.0],label=u'中债综合总财富指数',lw=2.5)
+plt.plot(equal_net_value['中证800'],c=[1.0,0.8,0.0],label=u'中证800',lw=2.5)
+plt.plot(equal_net_value['等权重'],'r',label=u'等权重',lw=2.5)
+x = DateFormatter('%Y-%m-%d') # 设定x轴datetime显示格式
+plt.gca().xaxis.set_major_formatter(x)
+plt.xticks(fontsize=13,rotation=30)
+plt.xlim([equal_net_value.index[0],equal_net_value.index[-1]]) # 设置x轴刻度范围
+plt.xticks([dt.datetime(2005+j,1,4) for j in range(19)])
+plt.yticks(fontsize=13)
+plt.ylim([0,7])
+plt.title('图3：三类资产的历史净值曲线',fontsize=13)
+plt.legend(loc=0,fontsize=10)
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图3：三类资产的历史净值曲线.png',dpi=800)
+#%%
+# 表2：三类资产历史表现
+t2_info = equal_net_value.copy()
+t2 = pd.DataFrame()
+name_list = ['上海黄金现货','中债综合总财富指数','中证800','等权重']
+for j in name_list:
+    t2.loc[j,'年化收益率'] = Performance(t2_info[j]).annualized_returns
+    t2.loc[j,'波动率'] = Performance(t2_info[j]).annualized_volatility
+    t2.loc[j,'夏普'] = Performance(t2_info[j]).cal_sharp()
+    t2.loc[j,'最大回撤'] = Performance(t2_info[j]).max_drawdown()
+    t2.loc[j,'卡玛比率'] = Performance(t2_info[j]).cal_calmar()
+t2.to_excel(r'./output/表2：三类资产历史表现.xlsx')
+#%%
+# 表3：各类资产历年风险收益情况
+t3_info = equal_net_value.copy()
+t3_info['date'] = t3_info.index.strftime('%Y')
+N = t3_info.index[-1].year - t3_info.index[0].year + 1
+start_year = '2005' # 设置起始时间
+t3 = pd.DataFrame()
+name_list = ['中证800','中债综合总财富指数','上海黄金现货','等权重']
+# 计算各资产和等权重组合各年度最大回撤
+for i in range(N):
+    for j in name_list:
+        net = (1+t3_info.loc[t3_info['date'] == start_year,j+'每日涨跌幅']).cumprod()
+        t3.loc[start_year,j+'_收益率'] = Performance(net).annualized_returns
+        t3.loc[start_year,j+'_波动率'] = Performance(net).annualized_volatility
+        t3.loc[start_year,j+'_最大回撤'] = Performance(net).max_drawdown()
+    start_year = str(int(start_year) + 1)
+t3.to_excel(r'./output/表3：各类资产历年风险收益情况.xlsx')
+#%%
+"""
+3. 战略:风险预算模型实践.. 10 
+3.1 风险预算模型介绍....
+3.2风险预算模型实践 11 
+    图4：风险预算 vs 固定股债比净值（2013.1.1-2023.8.30）
+    表6：风险预算和固定比例业绩表现（2013.1.1-2023.8.30）
+    图5：风险预算vs固定股债比仓位（2013.1.1-2023.8.30）
+"""
+# 选定所需数据
+rets = equal_net_value[['中证800每日涨跌幅','中债综合总财富指数每日涨跌幅']]
+# 回测月数m_s
+m_s = get_last_day(2012,2024) # 获取时间范围内每个月的最后一天并格式化成'yyyy-mm-dd'的datetime格式
+m_s = m_s[11:-4] # 去掉回测期以外的时间范围。
+p5_w = pd.DataFrame() # p5_w存储风险预算分配股债权重
+for i in m_s:
+    i_rets = rets.loc[:i,:][-60:]
+    cov = np.array(i_rets.cov())
+    w = risk_budgeting(cov)
+    if w[0] > 0.3:
+        w[0] = 0.3 # 限制风险资产（股票）仓位<=30%
+        w[1] = 0.7
+    p5_w.loc[i+timedelta(days=1),'中证800'] = w[0]
+    p5_w.loc[i+timedelta(days=1),'中债综合总财富指数'] = w[1]
+# 可视化————图5:风险预算vs固定股债比仓位
+fig,ax = plt.subplots(figsize=(8,5))
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.stackplot(p5_w.index, p5_w.iloc[:,0],p5_w.iloc[:,1],
+              labels=(u'中证800',u'中债综合总财富指数'),
+              colors = ['#003D79','#FFD306'] )
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.gca().yaxis.set_major_formatter(ticker.PercentFormatter(1)) #纵轴设置为百分比
+plt.xticks(fontsize=10,rotation=30)
+plt.xlim([p5_w.index[0],p5_w.index[-1]]) # 设置x轴刻度范围
+plt.xticks([dt.datetime(2013+j,1,1) for j in range(11)])
+plt.ylim([0,1])
+plt.yticks([0,0.2,0.4,0.6,0.8,1],fontsize=10)
+plt.legend(loc=0,fontsize=13)
+plt.title(u'图5:风险预算vs固定股债比仓位')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图5：风险预算vs固定股债比仓位.png',dpi=800)
+#%%
+# 图4：风险预算 vs 固定股债比净值
+p4 = (p5_w.loc[:'2023-08-30',:]).copy()
+p4.rename(columns={'中证800':'风险预算_中证800','中债综合总财富指数':'风险预算_中债综合总财富指数'},inplace=True)
+# 固定比例股债数据设定
+p4.loc[:,'固定比例_中证800'] = 0.2
+p4.loc[:,'固定比例_中债综合总财富指数'] = 0.8
+p4 = pd.concat([p4,equal_net_value[['中证800每日涨跌幅','中债综合总财富指数每日涨跌幅']]],axis=1) # 拼接数据：股债权重与每日涨跌幅
+p4 = p4.loc['2013-01-01':,:] # 只取所需时间段
+# 通过fillna判断每月最后一天是否是交易日，如果不是，则当天涨跌幅赋值为0
+p4['中证800每日涨跌幅'].fillna(value=0,inplace=True)
+p4['中债综合总财富指数每日涨跌幅'].fillna(value=0,inplace=True)
+# 填充权重缺失值
+p4.fillna(method='ffill',inplace=True) 
+# 固定比例股债20/80净值
+p4['固定比例股债20/80_每日涨跌幅'] = p4['固定比例_中证800'] * p4['中证800每日涨跌幅'] + p4['固定比例_中债综合总财富指数'] * p4['中债综合总财富指数每日涨跌幅']
+p4['固定比例股债20/80']  = (1+p4['固定比例股债20/80_每日涨跌幅'] ).cumprod()
+# 风险预算股债98/2净值
+p4['风险预算股债98/2_每日涨跌幅'] = p4['风险预算_中证800'] * p4['中证800每日涨跌幅'] + p4['风险预算_中债综合总财富指数'] * p4['中债综合总财富指数每日涨跌幅']
+p4['风险预算股债98/2'] = (1+p4['风险预算股债98/2_每日涨跌幅']).cumprod()
+# 超额
+p4['超额'] = p4['风险预算股债98/2'] - p4['固定比例股债20/80']
+# 绘图可视化————图4:风险预算 vs 固定股债比净值
+fig, ax1 = plt.subplots(figsize=(8,4))
+ax1.spines['top'].set_visible(False)
+l1 = ax1.fill_between(p4.index,p4['超额'],label='超额',color ='#FFD306' ,interpolate=True)
+plt.xticks(fontsize=10,rotation=30)
+plt.yticks(fontsize=10)
+plt.ylim([-0.05,0.3])
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = ax2.plot(p4['风险预算股债98/2'], lw=2.5,label='风险预算股债98/2（右）',color='royalblue')#'cornflowerblue'
+l3, = ax2.plot(p4['固定比例股债20/80'], lw=2.5,label='固定比例股债20/80（右）',color='#003D79')
+plt.xlim([p4.index[0],p4.index[-2]])  # 设置x轴刻度范围
+plt.ylim([0.8,2])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+# 图例合并
+g = [l1, l2 ,l3]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.title(u'图4:风险预算 vs 固定股债比净值')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图4：风险预算 vs 固定股债比净值.png',dpi=800)
+#%%
+# 表6：风险预算和固定比例业绩表现
+t6_net = p4[['固定比例股债20/80','风险预算股债98/2']]
+t6_net['year'] = t6_net.index.year
+y_s = t6_net.index[-1].year - t6_net.index[0].year + 1
+t6 = pd.DataFrame()
+start_year = 2013
+name_list = ['固定比例股债20/80','风险预算股债98/2']
+perform_list = ['收益率','波动率','夏普','最大回撤','卡玛比率']
+for i in range(y_s):
+    temp_1 = t6_net[ t6_net['year'] ==  start_year]
+    for j in name_list:
+        t6.loc[start_year,'收益率_'+j] = Performance(temp_1[j]).annualized_returns
+        t6.loc[start_year,'波动率_'+j] = Performance(temp_1[j]).annualized_volatility
+        t6.loc[start_year,'夏普_'+j] = Performance(temp_1[j]).cal_sharp()
+        t6.loc[start_year,'最大回撤_'+j] = Performance(temp_1[j]).max_drawdown()
+        t6.loc[start_year,'卡玛比率_'+j] = Performance(temp_1[j]).cal_calmar()
+    start_year += 1
+for j in name_list:
+    t6.loc['区间','收益率_'+j] = Performance(p4[j]).annualized_returns
+    t6.loc['区间','波动率_'+j] = Performance(p4[j]).annualized_volatility
+    t6.loc['区间','夏普_'+j] = Performance(p4[j]).cal_sharp()
+    t6.loc['区间','最大回撤_'+j] = Performance(p4[j]).max_drawdown()
+    t6.loc['区间','卡玛比率_'+j] = Performance(p4[j]).cal_calmar()
+t6['相对夏普'] = t6['夏普_风险预算股债98/2']-t6['夏普_固定比例股债20/80']
+t6.to_excel(r'./output/表6：风险预算和固定比例业绩表现.xlsx')
+#%%
+"""
+4. 战术:股债择时模型、黄金择时模型.. 12 
+4.1 股债择时模型.... 13 
+4.1.1 ERP 股债性价比指标... 13 
+    图7：ERP信号对于指数顶部的预测效果明显（2010.1.12-2023.8.30）
+    图8：ERP信号回测净值（2010.6.30-2023.8.30）
+"""
+# 图7:ERP信号对于指数顶部的预测效果明显
+# 中证800指数滚动市盈率（PE_TTM），数据来源wind
+# pe_ttm = pd.read_csv(r'./数据/中证800指数滚动市盈率（PE_TTM）.csv')
+pe_ttm = pd.read_excel(r'./数据/中证800指数滚动市盈率（PE_TTM）.xlsx',sheet_name='Sheet1',index_col=0,header=3)
+pe_ttm.index = pd.to_datetime(pe_ttm.index)
+# 中国10年期国债收益率，数据来源https://cn.investing.com/rates-bonds/china-10-year-bond-yield-historical-data
+# bond10 = pd.read_csv(r'./数据/中国10年期国债收益率cn.investing.com.csv')
+# wind，（%）
+bond10 = pd.read_excel(r'./数据/国债到期收益率_10年.xlsx',sheet_name='国债到期收益率_10年(%)',index_col=0,header=0)
+bond10.index = pd.to_datetime(bond10.index)
+bond10 = bond10 / 100 # 换算成小数形式
+p7 = pd.concat([pe_ttm,bond10],axis=1)
+p7 = p7['2007-12-14':]
+p7['ERP'] = 1/p7['pe_ttm'] - p7['国债到期收益率:10年']
+
+p7.dropna(inplace=True)
+# ERP五年分位数
+end_index = p7['2010-01-12':].index
+for i in range(len(end_index)):
+    p7.loc[end_index[i],'ERP五年分位数'] = stats.percentileofscore(p7.loc[end_index[i]-timedelta(days=1826):end_index[i],'ERP'], p7.loc[end_index[i],'ERP'], kind='rank',nan_policy='omit')
+# 指数加权移动平均---窗口期120---alpha=1-(1/math.e)**(1/120)=0.01 效果太差
+# 修改为窗口期=2个交易日
+p7['ERP五年分位数'] = p7['ERP五年分位数'].ewm(alpha=1-(1/math.e)**(1/2),ignore_na=False,adjust=False).mean()
+#%%
+# # 图7可视化
+fig, ax1 = plt.subplots(figsize=(8,4))
+l1 = plt.fill_between(p7.index,p7['ERP五年分位数'],color = '#FFD306',label='ERP五年分位数(%)')
+plt.xticks(rotation=30)
+plt.xlim([p7['2010-01-12':].index[0],p7.index[-1]])  # 设置x轴刻度范围
+plt.ylim([0,100])
+ax1.spines['top'].set_visible(False)
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(index_800.loc['2010-01-12':,'close'],color = '#003D79',lw=2.5,label='中证800指数(右)')
+plt.ylim([2000,6500])
+plt.xlim([p7['2010-01-12':].index[0],p7.index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,1,12) for j in range(14)])
+# 图例合并
+g = [l1, l2 ]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.title(u'图7:ERP信号对于指数顶部的预测效果明显')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图7：ERP信号对于指数顶部的预测效果明显.png',dpi=800)
+#%%
+"""图8：不对劲🤨"""
+# 图8:ERP信号回测净值
+p8 = pd.concat([equal_net_value[['中证800每日涨跌幅']],p7['ERP五年分位数']],axis=1)
+p8['加权ERP'] = p8['ERP五年分位数']
+"""时间调整"""
+# 找出调仓日——每月最后一个交易日
+p8['date'] = p8.index
+p8['yyyymm'] = p8.index.strftime('%Y-%m')
+resize_list = p8.groupby(p8['yyyymm']).last()['date']
+# 分位数
+up = 80
+down = 20
+# 信号
+for i in resize_list:
+    if p8.loc[i,'加权ERP'] > up:
+        p8.loc[i,'signal'] = 1
+    elif p8.loc[i,'加权ERP'] < down:
+        p8.loc[i,'signal'] = -1
+    else:
+        p8.loc[i,'signal'] = 0
+# 以每月最后一个交易日的收盘价买入建仓，从次月第一个交易日开始持仓
+for i in resize_list:
+    if p8.loc[i,'signal'] == 1:
+        p8.loc[i,'建仓te'] = 1
+    elif p8.loc[i,'signal'] == -1:
+        p8.loc[i,'建仓te'] = -1
+    else:
+        p8.loc[i,'建仓te'] = 0
+p8['建仓'] = p8['建仓te'].shift(1)
+p8 = p8.fillna(method='ffill')
+condition1 = p8['建仓'] == 1
+p8.loc[condition1,'持仓'] = 1 * (1+0.3)
+condition2 = p8['建仓'] == -1
+p8.loc[condition2,'持仓'] = -1
+# 计算净值
+p8['加权ERP涨跌幅'] =  p8['持仓'] * p8['中证800每日涨跌幅'] 
+p8['加权ERP净值'] = (1+p8['加权ERP涨跌幅']).cumprod()
+p8['加权ERP净值'] = p8['加权ERP净值'].fillna(method='ffill')
+condition = p8['加权ERP净值'].dropna().index
+p8.loc[condition,'指数净值'] = (1 + p8.loc[condition,'中证800每日涨跌幅']).cumprod()
+p8.loc['2010-06-30','指数净值'] = 1
+p8.loc['2010-06-30','加权ERP净值'] = 1
+# 可视化————图8:ERP信号回测净值
+fig, ax1 = plt.subplots(figsize=(8,4))
+l1 = plt.fill_between(p8.index,p8['ERP五年分位数'],color = '#FFD306',label='ERP五年分位数(%)')
+plt.xticks(rotation=30)
+plt.xlim([p8['加权ERP净值'].dropna().index[0],p8['加权ERP净值'].dropna().index[-1]])  # 设置x轴刻度范围
+plt.ylim([0,100])
+ax1.spines['top'].set_visible(False)
+# plt.axhline(y=up, color='darkred', linestyle='--', linewidth=1)
+# plt.axhline(y=down, color='darkred', linestyle='--', linewidth=1)
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(p8['指数净值'], color='midnightblue',label='中证800净值(右)') 
+l3, = plt.plot(p8['加权ERP净值'], color='royalblue',label='加权ERP净值(右)') 
+plt.xlim([p8['加权ERP净值'].dropna().index[0],p8['加权ERP净值'].dropna().index[-1]])  # 设置x轴刻度范围
+# plt.axhline(y=1, color='red', linestyle='--', linewidth=1)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,6,30) for j in range(14)])
+plt.ylim([0,3])
+plt.title('图8:ERP信号回测净值')
+# 图例合并
+g = [l1, l2, l3]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9,loc=9)
+plt.tight_layout()
+plt.savefig('./output/图8：ERP信号回测净值.png',dpi=800)
+#%%
+"""
+4.1.2 股票量价指标.. 16 
+    图9：MA（5）信号在中证800指数上的择时效果（2010.3.31-2023.8.30）
+    图：单独的成交量信号在中证800指数上的择时效果(2010.6.30-2023.8.30)
+    图：量价指标：放量上涨+破均线下跌在中证800指数上的择时效果(2010.8.31-2023.8.30)
+    表10：量价信号结合表现(2010.8.31-2023.8.30)
+"""
+# 图9：MA（5）信号在中证800指数上的择时效果
+# 单独的股票MA信号————收盘价近N日均线
+N = 5
+p9 = equal_net_value[['close','中证800每日涨跌幅']]
+p9['MA_close'] = p9['close'].rolling(window= N ).mean()
+condition1 = p9['MA_close'] < p9['close']
+condition2 = p9['MA_close'] > p9['close']
+p9.loc[condition1,'signal'] = 1
+p9.loc[condition2,'signal'] = -1
+p9 = p9.loc['2010-03-31':,:]
+# 找出调仓日——每月最后一个交易日
+p9['date'] = p9.index
+p9['yyyymm'] = p9.index.strftime('%Y-%m')
+resize_list = p9.groupby(p9['yyyymm']).last()['date']
+# 以每月最后一个交易日的收盘价买入建仓，从次月第一个交易日开始持仓
+for i in resize_list:
+    if p9.loc[i,'signal'] == 1:
+        p9.loc[i,'建仓te'] = 1
+    elif p9.loc[i,'signal'] == -1:
+        p9.loc[i,'建仓te'] = -1
+    else:
+        p9.loc[i,'建仓te'] = 0
+p9['建仓'] = p9['建仓te'].shift(1)
+p9 = p9.fillna(method='ffill')
+condition1 = p9['建仓'] == 1
+p9.loc[condition1,'持仓'] = 1
+condition2 = p9['建仓'] == -1
+p9.loc[condition2,'持仓'] = -1
+p9['MA(5)持仓涨跌幅'] = p9['持仓'] * p9['中证800每日涨跌幅']
+p9['MA(5)持仓净值']  = (1+p9['MA(5)持仓涨跌幅']).cumprod()
+p9['MA(5)持仓净值'] = p9['MA(5)持仓净值'].fillna(method='ffill')
+p9.loc[p9['MA(5)持仓净值'].dropna().index,'指数净值'] = (1 + p9.loc[p9['MA(5)持仓净值'].dropna().index,'中证800每日涨跌幅']).cumprod()
+p9.loc['2010-03-31',['MA(5)持仓净值','指数净值']] = 1
+p9['超额'] = p9['MA(5)持仓净值'] - p9['指数净值'] 
+# 图9可视化
+fig, ax1 = plt.subplots(figsize=(9,4))
+l1 = plt.fill_between(p9.index,p9['超额'],color = '#FFD306',label='超额')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+ax1.spines['top'].set_visible(False)
+plt.xlim([p8.index[0],p8.index[-1]])
+plt.ylim([-0.5,3.5])
+plt.yticks([-0.5,0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5])
+ax2 = plt.twinx()
+l2, = plt.plot(p9['MA(5)持仓净值'], color='royalblue',label='MA（5，N，多空）(右)')
+l3, = plt.plot(p9['指数净值'],color='midnightblue',label='指数净值(右)')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,3,31) for j in range(14)])
+ax2.spines['top'].set_visible(False)
+plt.title('图9：MA（5）信号在中证800指数上的择时效果')
+plt.xlim([p9.index[0],p9.index[-1]])
+plt.ylim([0.5,4.5])
+plt.yticks([0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5])
+# 图例合并
+g = [l1, l2, l3]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.tight_layout()
+plt.savefig('./output/图9：MA（5）信号在中证800指数上的择时效果.png',dpi=800)
+#%%
+# 成交量近M日均线
+M = 5
+# volume_800 = pd.read_excel(r'./数据/800收益后复权.xlsx',sheet_name='Sheet2',index_col=0,header=3)
+volume_800 = pd.read_excel(r'./数据/800收益不复权.xlsx',sheet_name='Sheet1',index_col=0,header=3)
+volume_800.index = pd.to_datetime(volume_800.index)
+volume_800.rename(columns={'volume':'中证800成交量'},inplace=True)
+volume_800['成交量M='+str(M)] = volume_800['中证800成交量'].rolling(window = M ).mean()
+volume_800 = volume_800[['成交量M='+str(M),'中证800成交量']]
+volume_800 = pd.concat([volume_800,equal_net_value['中证800每日涨跌幅']],axis=1)
+# 信号
+condition1 = volume_800['成交量M='+str(M)]  < volume_800['中证800成交量']
+volume_800.loc[condition1,'signal'] = 1
+# 以每月最后一个交易日的收盘价买入建仓，从次月第一个交易日开始持仓
+for i in resize_list:
+    if volume_800.loc[i,'signal'] == 1:
+        volume_800.loc[i,'建仓te'] = 1
+    else :
+        volume_800.loc[i,'建仓te'] = 0
+volume_800['建仓'] = volume_800['建仓te'].shift(1)
+volume_800 = volume_800.fillna(method='ffill')
+condition = volume_800['建仓'] == 1
+volume_800.loc[condition,'持仓'] = 1
+volume_800 = volume_800.loc['2010-06-30':,:]
+# 计算净值
+volume_800['持仓涨跌幅'] = volume_800['持仓'] * volume_800['中证800每日涨跌幅'] 
+volume_800['持仓净值']  = (1+volume_800['持仓涨跌幅']).cumprod()
+volume_800['持仓净值'] = volume_800['持仓净值'].fillna(method='ffill')
+volume_800.loc[volume_800['持仓净值'].dropna().index,'指数净值'] = (1 + volume_800.loc[volume_800['持仓净值'].dropna().index,'中证800每日涨跌幅']).cumprod()
+volume_800['超额'] = volume_800['持仓净值'] - volume_800['指数净值'] 
+volume_800.loc['2010-06-30',['持仓净值','指数净值']] = 1
+# 可视化——单独的成交量信号M=5
+fig, ax1 = plt.subplots(figsize=(9,4))
+l1 = plt.fill_between(volume_800.index,volume_800['超额'],color = '#FFD306',label='超额')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+ax1.spines['top'].set_visible(False)
+plt.ylim([-0.5,2])
+plt.xlim([p8.index[0],p8.index[-1]])
+ax2 = plt.twinx()
+l2, = plt.plot(volume_800['持仓净值'], color='royalblue',label='成交量（5，M，多头）(右)')
+l3, = plt.plot(volume_800['指数净值'],color='midnightblue',label='指数净值(右)')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,6,30) for j in range(14)])
+ax2.spines['top'].set_visible(False)
+plt.title('单独的成交量信号在中证800指数上的择时效果')
+plt.xlim([volume_800['持仓净值'].dropna().index[0],volume_800['持仓净值'].dropna().index[-1]])
+plt.ylim([0.5,4])
+# 图例合并
+g = [l1, l2, l3]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9,loc=2)
+plt.tight_layout()
+plt.savefig('./output/单独的成交量信号在中证800指数上的择时效果.png',dpi=800)
+#%%
+# 表10:量价信号结合表现——均线和成交量同时发出看多信号，买入；当均线发出看空信号时，卖出
+t10 = pd.concat([volume_800[['成交量M='+str(M),'中证800成交量']],p9[['close','MA_close','中证800每日涨跌幅']]],axis=1)
+# 按上述实操回测结果80效果显著，改成80
+condition1 = t10['中证800成交量'] > t10['成交量M='+str(M)]
+condition2 = t10['close'] > t10['MA_close']
+condition3 = t10['close'] < t10['MA_close']
+# 构建信号
+t10.loc[condition1,'成交量M='+str(M)+'signal'] = 1
+t10.loc[condition2,'均线signal'] = 1
+t10.loc[condition3,'均线signal'] = -1
+t10.loc[condition1&condition2,'多头signal'] = 1
+t10.loc[condition1&condition2,'多空signal'] = 1
+t10.loc[condition3,'多空signal'] = -1
+# 找出调仓日——每月最后一个交易日
+t10['date'] = t10.index
+t10['yyyymm'] = t10.index.strftime('%Y-%m')
+resize_list = t10.groupby(p8['yyyymm']).last()['date']
+for i in resize_list:
+    # 成交量信号建仓
+    if t10.loc[i,'成交量M='+str(M)+'signal'] == 1:
+        t10.loc[i,'成交量M='+str(M)+'建仓te'] = 1
+    else :
+        t10.loc[i,'成交量M='+str(M)+'建仓te'] = 0
+    # 均线信号建仓
+    if t10.loc[i,'均线signal'] == 1:
+        t10.loc[i,'均线建仓te'] = 1
+    elif t10.loc[i,'均线signal'] == -1:
+        t10.loc[i,'均线建仓te'] = -1
+    else:
+        t10.loc[i,'均线建仓te'] = 0
+    # 多头信号建仓
+    if t10.loc[i,'多头signal'] == 1:
+        t10.loc[i,'多头建仓te'] = 1
+    else:
+        t10.loc[i,'多头建仓te'] = 0
+    # 多空信号建仓
+    if t10.loc[i,'多空signal'] == 1:
+        t10.loc[i,'多空建仓te'] = 1
+    elif t10.loc[i,'多空signal'] == -1:
+        t10.loc[i,'多空建仓te'] = -1
+    else:
+        t10.loc[i,'多空建仓te'] = 0
+pos_list = ['成交量M='+str(M)+'建仓','均线建仓','多头建仓','多空建仓']
+for i in pos_list:
+    t10[i] = t10[i+'te'].shift(1)
+    t10[i] = t10[i].fillna(method='ffill')
+# t10 = t10.fillna(method='ffill')
+for i in pos_list:
+    condition1 = t10[i] == 1
+    condition2 = t10[i] == -1
+    t10.loc[condition1,i[:-2]+'持仓'] = 1
+    t10.loc[condition2,i[:-2]+'持仓'] = -1
+# 各个指标发出的建仓信号的起始时间不一致
+# 这里统一为2010-8-31各个指标均发出建仓信号的最早日期
+t10 = t10.loc['2010-8-31':,:]
+for i in pos_list:
+    t10[i[:-2]+'持仓涨跌幅'] = t10[i[:-2]+'持仓'] * t10['中证800每日涨跌幅']
+    t10[i[:-2]+'持仓净值'] = (1 + t10[i[:-2]+'持仓涨跌幅']).cumprod()
+    t10[i[:-2]+'持仓净值'] = t10[i[:-2]+'持仓净值'].fillna(method='ffill')
+t10.loc[t10['多空持仓净值'].dropna().index,'指数净值'] = (1 + t10.loc[t10['多空持仓净值'].dropna().index,'中证800每日涨跌幅']).cumprod()
+t10.loc['2010-8-31',['均线持仓净值','成交量M='+str(M)+'持仓净值','多空持仓净值','指数净值','多头持仓净值']] = 1
+# 可视化表10——量价指标：放量上涨+破均线下跌
+fig, ax1 = plt.subplots(figsize=(9,4))
+color_list = ['darkorange','gold','lightsteelblue','royalblue']
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+for i in range(len(pos_list)):
+    plt.plot(t10[pos_list[i][:-2]+'持仓净值'], color=color_list[i] ,label=pos_list[i][:-2])
+plt.plot(t10.loc[t10['多空持仓净值'].dropna().index,'指数净值'] ,color='midnightblue',label='指数净值')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,8,31) for j in range(14)])
+plt.title('量价指标：放量上涨+破均线下跌在中证800指数上的择时效果')
+plt.xlim([t10.index[0],t10.index[-1]])
+plt.tight_layout()
+plt.legend(fontsize=9)
+plt.savefig('./output/量价指标：放量上涨+破均线下跌在中证800指数上的择时效果.png',dpi=800)
+#%%
+# 表10:量价信号结合表现
+t10_ = pd.DataFrame()
+# 原始
+t10_.loc['调仓频率','原始'] = 'M'
+t10_.loc['累计净值','原始'] = Performance(t10['指数净值'].dropna()).accumulate_net_value()
+t10_.loc['合计周期','原始'] = len(resize_list)
+t10_.loc['信号次数','原始'] = len(resize_list)
+t10_.loc['多头','原始'] = len(resize_list)
+t10_.loc['空头','原始'] = 0
+condition = t10.loc[t10['指数净值'].dropna().index,'中证800每日涨跌幅']
+t10_.loc['胜率','原始'] = round(len(condition[condition>0]) / len(condition),2)
+t10_.loc['盈亏比','原始'] = round(len(condition[condition>0])/len(condition[condition<0]),2)
+t10_.loc['期望','原始'] = Statistic_data(resize_list,resize_list,condition).expectation()
+t10_.loc['年化收益','原始'] = Performance(t10['指数净值'].dropna()).annualized_returns 
+t10_.loc['波动','原始'] = Performance(t10['指数净值'].dropna()).annualized_volatility
+t10_.loc['夏普','原始'] = Performance(t10['指数净值'].dropna()).cal_sharp()
+t10_.loc['最大回撤','原始'] = Performance(t10['指数净值'].dropna()).max_drawdown()
+for i in pos_list:
+    t10_.loc['调仓频率',i[:-2]] = 'M'
+    t10_.loc['累计净值',i[:-2]] = Performance(t10[i[:-2]+'持仓净值'].dropna()).accumulate_net_value()
+    t10_.loc['合计周期',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).sum_period()
+    t10_.loc['信号次数',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).sum_signal()
+    t10_.loc['多头',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).sum_long_signal()
+    t10_.loc['空头',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).sum_short_signal()
+    t10_.loc['胜率',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).win_rate()
+    t10_.loc['盈亏比',i[:-2]] = Statistic_data(resize_list, t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).profi_loss_ratio()
+    t10_.loc['期望',i[:-2]] = Statistic_data(resize_list,t10[i[:-2]+'建仓te'],t10[i[:-2]+'持仓涨跌幅']).expectation()
+    t10_.loc['年化收益',i[:-2]] = Performance(t10[i[:-2]+'持仓净值'].dropna()).annualized_returns 
+    t10_.loc['波动',i[:-2]] =  Performance(t10[i[:-2]+'持仓净值'].dropna()).annualized_volatility
+    t10_.loc['夏普',i[:-2]] =  Performance(t10[i[:-2]+'持仓净值'].dropna()).cal_sharp()
+    t10_.loc['最大回撤',i[:-2]] =  Performance(t10[i[:-2]+'持仓净值'].dropna()).max_drawdown()
+t10_.to_excel(r'./output/表10：量价信号结合表现.xlsx')
+#%%
+"""
+4.1.3 合成信号. ..18 
+    图10：合成指标净值(2010.6.30-2023.8.30)
+    图11：合成指标回撤(2010.6.30-2023.8.30)
+    表11：ERP+量价指标信号(2010.6.30-2023.8.30)
+"""
+# 图10：合成指标净值
+# ERP+量价——加仓/减仓 ,'加权ERP净值',t10['多空持仓净值']
+p10 = pd.concat([p8[['加权ERP']],volume_800[['成交量M='+str(M),'中证800成交量']],p9[['close','MA_close','中证800每日涨跌幅']]],axis=1)
+# 看多信号
+condition1 = p10['加权ERP'] > up
+condition2 = p10['close'] > p10['MA_close']
+condition3 = p10['中证800成交量'] > p10['成交量M='+str(M)]
+# 看空信号
+condition4 = p10['加权ERP'] < down
+condition5 = p10['close'] < p10['MA_close']
+# signal
+p10.loc[condition1,'加权ERP信号signal'] = 1
+p10.loc[condition4,'加权ERP信号signal'] = -1
+p10['加权ERP信号signal'] = p10['加权ERP信号signal'].fillna(value=0)
+p10.loc[condition2&condition3,'量价信号signal'] = 1
+p10.loc[condition5,'量价信号signal'] = -1
+p10['量价信号signal'] = p10['量价信号signal'].fillna(value=0) 
+p10['信号结合signal'] = p10['加权ERP信号signal'] + p10['量价信号signal']
+p10 = p10.loc['2010-6-30':,:]
+# 找出调仓日——每月最后一个交易日
+p10['date'] = p10.index
+p10['yyyymm'] = p10.index.strftime('%Y-%m')
+resize_list = p10.groupby(p10['yyyymm']).last()['date']
+# # signal
+for i in resize_list:
+    # 信号结合（多空\多头）
+    if p10.loc[i,'信号结合signal'] == 2:
+        p10.loc[i,'信号结合建仓te'] = 1
+        p10.loc[i,'信号结合多头建仓te'] = 1
+    elif p10.loc[i,'信号结合signal'] == -2:
+        p10.loc[i,'信号结合建仓te'] = -1
+    else:
+        p10.loc[i,'信号结合建仓te'] = 0
+        p10.loc[i,'信号结合多头建仓te'] = 0
+    # 加权ERP信号
+    if p10.loc[i,'加权ERP信号signal'] == 1:
+        p10.loc[i,'加权ERP信号建仓te'] = 1
+    elif p10.loc[i,'加权ERP信号signal'] == -1:
+        p10.loc[i,'加权ERP信号建仓te'] = -1
+    else:
+        p10.loc[i,'加权ERP信号建仓te'] = 0
+    # 量价信号
+    if p10.loc[i,'量价信号signal'] == 1:
+        p10.loc[i,'量价信号建仓te'] = 1
+    elif p10.loc[i,'量价信号signal'] == -1:
+        p10.loc[i,'量价信号建仓te'] = -1
+    else: 
+        p10.loc[i,'量价信号建仓te'] = 0
+
+pos_list = ['信号结合建仓','信号结合多头建仓','加权ERP信号建仓','量价信号建仓']
+for i in pos_list:
+    p10[i] = p10[i+'te'].shift(1)
+    p10[i] = p10[i].fillna(method='ffill')
+for i in pos_list:
+    condition1 = p10[i] == 1
+    condition2 = p10[i] == -1
+    p10.loc[condition1,i[:-2]+'持仓'] = 1 
+    p10.loc[condition2,i[:-2]+'持仓'] = -1
+# 计算净值
+for i in pos_list:
+    p10[i[:-2]+'持仓涨跌幅'] = p10[i[:-2]+'持仓'] * p10['中证800每日涨跌幅']* (1+0.5)
+    p10[i[:-2]+'持仓净值'] = 1 + p10[i[:-2]+'持仓涨跌幅']
+    p10.loc['2010-6-30',i[:-2]+'持仓净值'] = 1
+    p10[i[:-2]+'持仓净值'] = p10[i[:-2]+'持仓净值'].cumprod()
+    p10[i[:-2]+'持仓净值'] = p10[i[:-2]+'持仓净值'].fillna(method='ffill')
+for i in resize_list:
+    p10.loc[i,'指数建仓te'] = 1
+p10['指数持仓涨跌幅'] = p10['中证800每日涨跌幅']
+p10['指数持仓净值'] = 1 + p10['中证800每日涨跌幅']
+p10.loc['2010-6-30','指数持仓净值'] = 1
+p10['指数持仓净值'] = p10['指数持仓净值'].cumprod()
+# 可视化————图10：合成指标净值
+fig, ax1 = plt.subplots(figsize=(9,4))
+color_list = ['red','royalblue','gold']
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+pos_list = ['信号结合建仓','加权ERP信号建仓','量价信号建仓']
+for i in range(len(pos_list)):
+    plt.plot(p10[pos_list[i][:-2]+'持仓净值'], color=color_list[i] ,label=pos_list[i][:-2])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks([dt.datetime(2010+j,6,30) for j in range(14)])
+plt.xticks(rotation=30)
+plt.title('图10：合成指标净值')
+plt.ylim([0,6])
+plt.xlim([p10['信号结合持仓净值'].dropna().index[0],p10['信号结合持仓净值'].dropna().index[-1]])
+plt.legend(fontsize=9)
+plt.tight_layout()
+plt.savefig('./output/图10：合成指标净值.png',dpi=800)
+#%%
+# 图11:合成指标回撤
+# 可视化————图11:合成指标回撤
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['bottom'].set_visible(False)
+plt.plot(drawdown(p10['信号结合持仓净值'].dropna()),color='royalblue',label='合成指标回撤')
+plt.plot(drawdown(p10['指数持仓净值'].dropna()),color='gold',label='原始回撤')
+plt.axhline(y=0, color='black', linestyle='-', linewidth=0.9)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2010+j,6,30) for j in range(14)])
+plt.xlim([p10['信号结合持仓净值'].dropna().index[0],p10['信号结合持仓净值'].dropna().index[-1]])
+plt.ylim([-0.6,0])
+plt.title('图11:合成指标回撤')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图11：合成指标回撤.png',dpi=800)
+#%%
+# 表11:ERP+量价指标信号
+t11 = pd.DataFrame()
+name_list =  p10[['指数持仓净值','信号结合多头持仓净值','信号结合持仓净值']].columns
+for i in name_list:
+    t11.loc['调仓频率',i[:-4]] = 'M'
+    t11.loc['累计净值',i[:-4]] = Performance(p10[i[:-4]+'持仓净值'].dropna()).accumulate_net_value()
+    t11.loc['合计周期',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).sum_period()
+    t11.loc['信号次数',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).sum_signal()
+    t11.loc['多头',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).sum_long_signal()
+    t11.loc['空头',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).sum_short_signal()
+    t11.loc['胜率',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).win_rate()
+    t11.loc['盈亏比',i[:-4]] = Statistic_data(resize_list, p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).profi_loss_ratio()
+    t11.loc['期望',i[:-4]] = Statistic_data(resize_list,p10[i[:-4]+'建仓te'],p10[i[:-4]+'持仓涨跌幅']).expectation()
+    t11.loc['年化收益',i[:-4]] = Performance(p10[i[:-4]+'持仓净值'].dropna()).annualized_returns 
+    t11.loc['波动',i[:-4]] =  Performance(p10[i[:-4]+'持仓净值'].dropna()).annualized_volatility
+    t11.loc['夏普',i[:-4]] =  Performance(p10[i[:-4]+'持仓净值'].dropna()).cal_sharp()
+    t11.loc['最大回撤',i[:-4]] =  Performance(p10[i[:-4]+'持仓净值'].dropna()).max_drawdown()
+t11.to_excel(r'./output/表11：ERP+量价指标信号.xlsx')
+#%%
+"""
+4.2 黄金择时指标..... 20 
+4.2.1十年期美债实际收益率.... .21 
+    图13：黄金和美债实际收益率负相关性明显(2004.1.2-2023.8.30)
+    图14：美债实际收益率均线信号择时效果(2004.2.27-2023.8.30)
+    表14：美债均线指标不同参数多空效果(2004.2.27-2023.8.30)
+"""
+# 指标准备
+# 10年期美债实际收益率（TIPS收益率）和CBOE的VIX指数
+# tips_vix = pd.read_excel('/Users/gulining/Downloads/研究生-/课程资料/研一下/（研）Python与金融数据分析（22-23-2）/期末考核/数据/TIPS收益率&VIX指数.xlsx',sheet_name='Sheet1',index_col=0,header=3)
+tips_vix = pd.read_excel(r'./数据/TIPS收益率&VIX指数.xlsx',sheet_name='Sheet1',index_col=0,header=2)
+tips_vix = tips_vix.iloc[1:,:]
+tips_vix.index = pd.to_datetime(tips_vix.index)
+tips_vix.rename(columns={'10Y美国国债收益率(以通胀为标的)':'TIPS收益率',
+                         'CBOE波动率':'VIX指数'},inplace=True)
+# 可视化————图13:黄金和美债实际收益率负相关性明显
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+l1, = plt.plot(tips_vix['TIPS收益率'],color='royalblue',label='十年期美债收益率')
+ax1.spines['bottom'].set_position(('data', 0))
+plt.ylim([-1.5,3.5])
+plt.yticks([-1.5,-1,-0.5,0,0.5,1,1.5,2,2.5,3,3.5])
+plt.xticks(rotation=30)
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(au9999['Au'],color='gold',label='黄金价格(右)')
+ax2.spines['bottom'].set_position(('data', 150))
+plt.ylim([0,500])
+plt.yticks([0,50,100,150,200,250,300,350,400,450,500])
+plt.xlim([au9999.index[0],au9999.index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2004+j,1,2) for j in range(20)])
+# # 图例合并
+g =[ l1,l2 ]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.title('图13:黄金和美债实际收益率负相关性明显')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图13：黄金和美债实际收益率负相关性明显.png',dpi=800)
+#%%
+p14 = pd.concat([tips_vix['TIPS收益率'],au9999['上海黄金现货每日涨跌幅']],axis=1)
+# 图14:美债实际收益率均线信号择时效果
+resize_list_au,long_short_N20 = signal_count_net_value_au(daily_return_df=p14[['TIPS收益率','上海黄金现货每日涨跌幅']],N=20,name='多空')
+p14['多空持仓净值']  = long_short_N20['多空持仓净值']
+p14.loc[p14['多空持仓净值'].dropna().index,'原始净值'] = (1 + p14.loc[p14['多空持仓净值'].dropna().index,'上海黄金现货每日涨跌幅']).cumprod()
+p14.loc['2004-2-27',['原始净值','多空持仓净值']] = 1
+p14['超额'] = p14['多空持仓净值'] - p14['原始净值']
+# 可视化————图14:美债实际收益率均线信号择时效果
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+l1 = ax1.fill_between(p14['超额'].index,p14['超额'],label='超额',color = 'orange',interpolate=True,alpha=0.7)
+plt.ylim([-1,5])
+plt.xticks(rotation=30)
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(p14['多空持仓净值'],color='darkblue',label='美债均线择时净值(右)')
+l3, = plt.plot(p14['原始净值'],color='royalblue',label='原始净值(右)')
+plt.xlim([p14['超额'].dropna().index[0],p14['超额'].dropna().index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2004+j,2,27) for j in range(20)])
+plt.ylim([0,9])
+# # 图例合并
+g =[ l1,l2,l3 ]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.title('图14:美债实际收益率均线信号择时效果')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图14：美债实际收益率均线信号择时效果.png',dpi=800)
+#%%
+# 表14:美债均线指标不同参数多空效果
+name_list_au = ['纯多头','纯空头','多空']
+t14 = pd.DataFrame()
+for i in name_list_au:
+    if i != '多空':
+        N_list =[1,15,20,25]
+    else:
+        N_list =[15,20,25]
+    for j in N_list:
+        t14.loc['调仓频率',i+'_'+str(j)] = 'M'
+        resize_list_au_temp,temp_df = signal_count_net_value_au(daily_return_df=p14[['TIPS收益率','上海黄金现货每日涨跌幅']],N=j,name=i)
+        t14.loc['累计净值',i+'_'+str(j)] = Performance(temp_df[i+'持仓净值'].dropna()).accumulate_net_value()
+        t14.loc['合计周期',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).sum_period()
+        t14.loc['信号次数',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).sum_signal()
+        t14.loc['多头',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).sum_long_signal()
+        t14.loc['空头',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).sum_short_signal()
+        t14.loc['胜率',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).win_rate()
+        t14.loc['盈亏比',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).profi_loss_ratio()
+        t14.loc['期望',i+'_'+str(j)] = Statistic_data(resize_list_au_temp, temp_df[i+'建仓te'],temp_df[i+'持仓涨跌幅']).expectation()
+        t14.loc['年化收益',i+'_'+str(j)] = Performance(temp_df[i+'持仓净值'].dropna()).annualized_returns 
+        t14.loc['波动',i+'_'+str(j)] = Performance(temp_df[i+'持仓净值'].dropna()).annualized_volatility
+        t14.loc['夏普',i+'_'+str(j)] = Performance(temp_df[i+'持仓净值'].dropna()).cal_sharp()
+        t14.loc['最大回撤',i+'_'+str(j)] = Performance(temp_df[i+'持仓净值'].dropna()).max_drawdown()
+t14.rename(columns={'纯多头_1':'纯多头_原始','纯空头_1':'纯空头_原始'},inplace=True)
+t14.to_excel(r'./output/表14：美债均线指标不同参数多空效果.xlsx')
+#%%
+"""
+4.2.2 VIX 恐慌指数
+    图16:VIX指标择时净值表现(2004.3.31-2023.8.30)
+    表15：VIX指标不同参数效果(2004.3.31-2023.8.30)
+"""
+p16 = pd.concat([tips_vix['VIX指数'],au9999['上海黄金现货每日涨跌幅']],axis=1)
+N = [10,15,20]
+days_list = ['原始']
+for i in N :
+    p16[str(i)+'天最大'] = p16['VIX指数'].rolling(window=i).max()
+    days_list.append(str(i)+'天最大')
+p16['20天均值'] = p16['VIX指数'].rolling(window=20).mean()
+days_list.append('20天均值')
+p16 = p16.loc['2004-3-31':,:]
+# 找出调仓日——每月最后一个交易日
+p16['date'] = p16.index
+p16['yyyymm'] = p16.index.strftime('%Y-%m')
+resize_list_vix = p16['date'].groupby(p16['yyyymm']).last()
+# 创建t15用于存放数据——表15:VIX指标不同参数效果
+t15 = pd.DataFrame()
+for i in days_list:
+    if i != '原始':
+        condition = p16[i] > 20
+        p16.loc[condition,i+'signal'] = 1
+        for j in resize_list_vix:
+            if p16.loc[j,i+'signal'] == 1:
+                p16.loc[j,i+'建仓te'] = 1
+            else:
+                p16.loc[j,i+'建仓te'] = 0
+    else:
+        for j in resize_list_vix:
+            p16.loc[j,i+'建仓te'] = 1
+    p16[i+'建仓'] = p16[i+'建仓te'].shift(1)
+    p16[i+'建仓'] = p16[i+'建仓'].fillna(method='ffill')
+    condition = p16[i+'建仓'] == 1
+    p16.loc[condition,i+'持仓'] = 1
+    p16[i+'持仓涨跌幅'] = p16[i+'持仓'] * p16['上海黄金现货每日涨跌幅']
+    p16[i+'持仓净值'] = (1 + p16[i+'持仓涨跌幅']).cumprod()
+    p16[i+'持仓净值'] = p16[i+'持仓净值'].fillna(method='ffill')
+    t15.loc['调仓频率',i] = 'M'
+    t15.loc['累计净值',i] = Performance(p16[i+'持仓净值'].dropna()).accumulate_net_value()
+    t15.loc['合计周期',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).sum_period()
+    t15.loc['信号次数',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).sum_signal()
+    t15.loc['多头',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).sum_long_signal()
+    t15.loc['空头',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).sum_short_signal()
+    t15.loc['胜率',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).win_rate()
+    t15.loc['盈亏比',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).profi_loss_ratio()
+    t15.loc['期望',i] = Statistic_data(resize_list_vix, p16[i+'建仓te'],p16[i+'持仓涨跌幅']).expectation()
+    t15.loc['年化收益',i] = Performance(p16[i+'持仓净值'].dropna()).annualized_returns 
+    t15.loc['波动',i] = Performance(p16[i+'持仓净值'].dropna()).annualized_volatility
+    t15.loc['夏普',i] = Performance(p16[i+'持仓净值'].dropna()).cal_sharp()
+    t15.loc['最大回撤',i] = Performance(p16[i+'持仓净值'].dropna()).max_drawdown()
+t15.to_excel(r'./output/表15：VIX指标不同参数效果.xlsx')
+#%%
+p16.loc['2004-3-31','15天最大持仓净值'] = 1
+# 可视化————图16:VIX指标择时净值表现
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+plt.plot(p16['原始持仓净值'],color='blue',label='原始净值')
+plt.plot(p16['15天最大持仓净值'],color='gold',label='vix指标择时净值')
+plt.xlim([p16['15天最大持仓净值'].dropna().index[0],p16['15天最大持仓净值'].dropna().index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2004+j,3,31) for j in range(20)])
+plt.legend(fontsize=9)
+plt.title('图16:VIX指标择时净值表现')
+plt.tight_layout()
+plt.show()
+plt.savefig('./output/图16：VIX指标择时净值表现.png',dpi=800)
+#%%
+"""
+4.2.3黄金价格动量 .26 
+    图18:黄金价格250日动量指标净值曲线(2005.1.31-2023.8.30)
+    表16:黄金价格动量不同参数回测情况(2005.1.31-2023.8.30)
+"""
+p18 = au9999[['Au','上海黄金现货每日涨跌幅']]
+N = [20,60,250]
+days_list = ['原始']
+for i in N :
+    p18[str(i)+'日动量'] = p18['Au'] / p18['Au'].shift(i) - 1
+    days_list.append(str(i)+'日动量')
+p18 = p18.loc['2005-1-31':,:]
+# 找出调仓日——每月最后一个交易日
+p18['date'] = p18.index
+p18['yyyymm'] = p18.index.strftime('%Y-%m')
+resize_list_mmtum = p18['date'].groupby(p18['yyyymm']).last()
+# 创建t16用于存放数据——表16:黄金价格动量不同参数回测情况
+t16 = pd.DataFrame()
+direction =['多头','空头']
+# 多头
+for d in direction:
+    if d == '多头':
+        for i in days_list:
+            if i != '原始':
+                condition = p18[i] > 0
+                p18.loc[condition,d+i+'signal'] = 1
+                for j in resize_list_mmtum:
+                    if p18.loc[j,d+i+'signal'] == 1:
+                        p18.loc[j,d+i+'建仓te'] = 1
+                    else:
+                        p18.loc[j,d+i+'建仓te'] = 0
+            else:
+                for j in resize_list_mmtum:
+                    p18.loc[j,d+i+'建仓te'] = 1
+            p18[d+i+'建仓'] = p18[d+i+'建仓te'].shift(1)
+            p18[d+i+'建仓'] = p18[d+i+'建仓'].fillna(method='ffill')
+            condition1 = p18[d+i+'建仓'] == 1
+            p18.loc[condition1,d+i+'持仓'] = 1
+            p18[d+i+'持仓涨跌幅'] = p18[d+i+'持仓'] * p18['上海黄金现货每日涨跌幅']
+            p18[d+i+'持仓净值'] = (1 + p18[d+i+'持仓涨跌幅']).cumprod()
+            p18[d+i+'持仓净值'] = p18[d+i+'持仓净值'].fillna(method='ffill')
+            t16.loc['调仓频率',d+i] = 'M'
+            t16.loc['累计净值',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).accumulate_net_value()
+            t16.loc['合计周期',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_period()
+            t16.loc['信号次数',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_signal()
+            t16.loc['多头',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_long_signal()
+            t16.loc['空头',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_short_signal()
+            t16.loc['胜率',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).win_rate()
+            t16.loc['盈亏比',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).profi_loss_ratio()
+            t16.loc['期望',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).expectation()
+            t16.loc['年化收益',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).annualized_returns 
+            t16.loc['波动',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).annualized_volatility
+            t16.loc['夏普',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).cal_sharp()
+            t16.loc['最大回撤',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).max_drawdown()
+    elif d == '空头':
+        for i in days_list:
+            if i != '原始':
+                condition = p18[i] < 0
+                p18.loc[condition,d+i+'signal'] = -1
+                for j in resize_list_mmtum:
+                    if p18.loc[j,d+i+'signal'] == -1:
+                        p18.loc[j,d+i+'建仓te'] = -1
+                    else:
+                        p18.loc[j,d+i+'建仓te'] = 0
+            else:
+                for j in resize_list_mmtum:
+                    p18.loc[j,d+i+'建仓te'] = -1        
+            p18[d+i+'建仓'] = p18[d+i+'建仓te'].shift(1)
+            p18[d+i+'建仓'] = p18[d+i+'建仓'].fillna(method='ffill')
+            condition2 = p18[d+i+'建仓'] == -1
+            p18.loc[condition2,d+i+'持仓'] = -1
+            p18[d+i+'持仓涨跌幅'] = p18[d+i+'持仓'] * p18['上海黄金现货每日涨跌幅']
+            p18[d+i+'持仓净值'] = (1 + p18[d+i+'持仓涨跌幅']).cumprod()
+            p18[d+i+'持仓净值'] = p18[d+i+'持仓净值'].fillna(method='ffill')
+            t16.loc['调仓频率',d+i] = 'M'
+            t16.loc['累计净值',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).accumulate_net_value()
+            t16.loc['合计周期',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_period()
+            t16.loc['信号次数',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_signal()
+            t16.loc['多头',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_long_signal()
+            t16.loc['空头',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).sum_short_signal()
+            t16.loc['胜率',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).win_rate()
+            t16.loc['盈亏比',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).profi_loss_ratio()
+            t16.loc['期望',d+i] = Statistic_data(resize_list_mmtum, p18[d+i+'建仓te'],p18[d+i+'持仓涨跌幅']).expectation()
+            t16.loc['年化收益',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).annualized_returns 
+            t16.loc['波动',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).annualized_volatility
+            t16.loc['夏普',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).cal_sharp()
+            t16.loc['最大回撤',d+i] = Performance(p18[d+i+'持仓净值'].dropna()).max_drawdown()
+t16.to_excel(r'./output/表16：黄金价格动量不同参数回测情况.xlsx')
+#%%
+# 可视化————图18:黄金价格250日动量指标净值曲线
+p18.loc['2005-1-31',['多头原始持仓净值','多头250日动量持仓净值']] = 1
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+plt.plot(p18['多头原始持仓净值'],color='blue',label='原始净值')
+plt.plot(p18['多头250日动量持仓净值'],color='gold',label='黄金动量择时净值')
+plt.xlim([p18['多头250日动量持仓净值'].dropna().index[0],p18['多头250日动量持仓净值'].dropna().index[-1]]) 
+plt.ylim([0,4.5])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2005+j,1,31) for j in range(19)])
+plt.legend(fontsize=9)
+plt.title('图18:黄金价格250日动量指标净值曲线')
+plt.tight_layout()
+# plt.show()
+plt.savefig('./output/图18：黄金价格250日动量指标净值曲线.png',dpi=800)
+#%%
+"""
+4.2.4 合成信号 ..........................28 
+    图20:黄金合成指标择时净值(2004.11.30-2023.8.30)
+    表17:黄金合成指标择时表现(2004.11.30-2023.8.30)
+    图21:黄金择时指标回撤(2004.11.30-2023.8.30)
+"""
+# 美债均线MA【20】+VIX【15天，MAX】+黄金价格动量【250】
+p20 = pd.concat([tips_vix,au9999[['Au','上海黄金现货每日涨跌幅']]],axis=1)
+p20['美债均线MA【20】'] = p20['TIPS收益率'].rolling(window=20).mean()
+p20['VIX【15天，MAX】'] = p20['VIX指数'].rolling(window=15).max()
+p20['黄金价格动量【250】'] = p20['Au'] / p18['Au'].shift(250) - 1
+# 加仓信号(1)
+condition1 = p20['TIPS收益率'] < p20['美债均线MA【20】']
+condition2 = p20['VIX【15天，MAX】'] > 20
+condition3 = p20['黄金价格动量【250】'] > 0
+# 减仓信号(-1)
+condition4 = p20['TIPS收益率'] > p20['美债均线MA【20】']
+# 建立信号
+p20.loc[condition1,'美债均线MA【20】signal' ] = 1
+p20.loc[condition2,'VIX【15天，MAX】signal'] = 1
+p20.loc[condition3,'黄金价格动量【250】signal'] = 1
+p20.loc[condition4,'美债均线MA【20】signal' ] = -1
+combine_list = ['美债均线MA【20】','VIX【15天，MAX】','黄金价格动量【250】']
+p20['合成signal'] = 0
+for i in combine_list:
+    p20[i+'signal'] = p20[i+'signal'].fillna(value=0)
+    p20['合成signal'] += p20[i+'signal']
+# 找出调仓日——每月最后一个交易日
+p20['date'] = p20.index
+p20['yyyymm'] = p20.index.strftime('%Y-%m')
+resize_list_combine = p20['date'].groupby(p20['yyyymm']).last()
+for i in resize_list_combine :
+    if p20.loc[i,'合成signal'] >= 2:
+        p20.loc[i,'合成信号多头建仓te'] = 1
+        p20.loc[i,'合成信号多空建仓te'] = 1
+    elif p20.loc[i,'合成signal'] < 0:
+        p20.loc[i,'合成信号多空建仓te'] = -1
+    else:
+        p20.loc[i,'合成信号多头建仓te'] = 0
+        p20.loc[i,'合成信号多空建仓te'] = 0
+for j in resize_list_combine:
+    p20.loc[j,'原始建仓te'] = 1
+p20 = p20.loc['2004-11-30':,:]
+direction = ['原始','合成信号多头','合成信号多空']
+# 创建t17用于存放数据——表17:黄金合成指标择时表现
+t17 = pd.DataFrame()
+for i in direction:
+    p20[i+'建仓'] = p20[i+'建仓te'].shift(1)
+    p20[i+'建仓'] = p20[i+'建仓'].fillna(method='ffill')
+    condition1 = p20[i+'建仓'] == 1
+    condition2 = p20[i+'建仓'] == -1
+    p20.loc[condition1,i+'持仓'] = 1 
+    p20.loc[condition2,i+'持仓'] = -1 
+    p20[i+'持仓涨跌幅'] = p20[i+'持仓'] * p20['上海黄金现货每日涨跌幅'] * (1+0.1)
+    p20[i+'持仓净值'] = (1 + p20[i+'持仓涨跌幅']).cumprod()
+    p20[i+'持仓净值'] = p20[i+'持仓净值'].fillna(method='ffill')
+    t17.loc['调仓频率',i] = 'M'
+    t17.loc['累计净值',i] = Performance(p20[i+'持仓净值'].dropna()).accumulate_net_value()
+    t17.loc['合计周期',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).sum_period()
+    t17.loc['信号次数',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).sum_signal()
+    t17.loc['多头',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).sum_long_signal()
+    t17.loc['空头',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).sum_short_signal()
+    t17.loc['胜率',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).win_rate()
+    t17.loc['盈亏比',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).profi_loss_ratio()
+    t17.loc['期望',i] = Statistic_data(resize_list_combine, p20[i+'建仓te'],p20[i+'持仓涨跌幅']).expectation()
+    t17.loc['年化收益',i] = Performance(p20[i+'持仓净值'].dropna()).annualized_returns 
+    t17.loc['波动',i] = Performance(p20[i+'持仓净值'].dropna()).annualized_volatility
+    t17.loc['夏普',i] = Performance(p20[i+'持仓净值'].dropna()).cal_sharp()
+    t17.loc['最大回撤',i] = Performance(p20[i+'持仓净值'].dropna()).max_drawdown()
+t17.to_excel(r'./output/表17：黄金合成指标择时表现.xlsx')
+#%%
+# 可视化————图20:黄金合成指标择时净值
+p20.loc['2004-11-30',['合成信号多空持仓净值','原始持仓净值']] = 1
+p20['超额'] = p20['合成信号多空持仓净值'] - p20['原始持仓净值']
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+l1 = ax1.fill_between(p20['超额'].index,p20['超额'],label='超额',color = 'orange',interpolate=True,alpha=0.7)
+plt.ylim([-2,6])
+# plt.yticks([-2,-1,0,1,2,3,4,5,6])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(p20['合成信号多空持仓净值'],color='royalblue',label='策略净值(合成指标)(右)',lw=2.5)
+l3, = plt.plot(p20['原始持仓净值'],color='darkblue',label='原始净值(右)',lw=2.5)
+plt.xlim([p20['超额'].dropna().index[0],p20['超额'].dropna().index[-1]]) 
+plt.ylim([1,10])
+# plt.yticks([1,2,3,4,5,6,7,8,9,10])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2004+j,11,30) for j in range(19)])
+# # 图例合并
+g =[ l1,l2,l3 ]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.title('图20:黄金合成指标择时净值')
+plt.tight_layout()
+plt.savefig('./output/图20：黄金合成指标择时净值.png',dpi=800)
+#%%
+# 可视化————图21:黄金择时指标回撤
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['bottom'].set_visible(False)
+plt.plot(drawdown(p20['合成信号多空持仓净值'].dropna()),color='gold',label='策略回撤',lw=2.5)
+plt.plot(drawdown(p20['原始持仓净值'].dropna()),color='royalblue',label='原始回撤',lw=2.5)
+plt.axhline(y=0, color='black', linestyle='-', linewidth=1)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2004+j,11,30) for j in range(19)])
+plt.xlim([p20['合成信号多空持仓净值'].dropna().index[0],p20['合成信号多空持仓净值'].dropna().index[-1]]) 
+plt.title('图21:黄金择时指标回撤')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图21：黄金择时指标回撤.png',dpi=800)
+#%%
+"""
+5.战略+战术.. 29 
+5.1 风险预算+股债择时...... 30 
+    表18：风险预算+股债择时指标业绩表现(2012.12.31-2023.8.30)
+    图23:加入股债择时的净值(2012.12.31-2023.8.30)
+    图24:加入股债择时的回撤(2012.12.31-2023.8.30)
+"""
+p23 = pd.concat([p5_w,p10[['信号结合持仓']],net_value_800['中证800每日涨跌幅'],net_value_bond['中债综合总财富指数每日涨跌幅']],axis=1)
+p23[['中证800','中债综合总财富指数']] = p23[['中证800','中债综合总财富指数']].fillna(method='ffill')
+p23['信号结合持仓'] = p23['信号结合持仓'].fillna(value=0)
+# 股债择时权重
+condition1 = p23['信号结合持仓'] == 1
+condition2 = p23['信号结合持仓'] == -1
+condition3 = p23['信号结合持仓'] == 0
+p23.loc[condition1,'中证800_择时'] = 0.3
+p23.loc[condition2,'中证800_择时'] = 0
+p23.loc[condition3,'中证800_择时'] = p23.loc[condition3,'中证800'] 
+p23['中债综合总财富指数_择时'] = 1 - p23['中证800_择时'] 
+p23 = p23.dropna()
+# 计算净值
+p23['风险预算'] =  p23['中证800每日涨跌幅']*p23['中证800']  + p23['中债综合总财富指数每日涨跌幅']*p23['中债综合总财富指数']
+p23['风险预算_股债择时'] = p23['中证800每日涨跌幅']*p23['中证800_择时']  + p23['中债综合总财富指数每日涨跌幅']*p23['中债综合总财富指数_择时']
+p23['风险预算_净值'] = (1+p23['风险预算']).cumprod()
+p23['风险预算_股债择时_净值'] = (1+p23['风险预算_股债择时']).cumprod()
+p23.loc['2012-12-31',['风险预算_净值','风险预算_股债择时_净值']] = 1
+p23 = p23.sort_index()
+p23['超额'] = p23['风险预算_股债择时_净值'] - p23['风险预算_净值']
+# 可视化————图23:加入股债择时的净值
+fig, ax1 = plt.subplots(figsize=(8,4))
+ax1.spines['top'].set_visible(False)
+l1 = plt.fill_between(p23.index,p23['超额'],color = '#FFD306',label='超额')
+plt.xticks(rotation=30)
+plt.xlim([p23['超额'].dropna().index[0],p23['超额'].dropna().index[-1]])  # 设置x轴刻度范围
+plt.ylim([-0.05,0.35])
+plt.axis('tight')
+ax2 = plt.twinx()
+ax2.spines['top'].set_visible(False)
+l2, = plt.plot(p23['风险预算_净值'], color='midnightblue',label='风险预算(右)',lw=2.5) 
+l3, = plt.plot(p23['风险预算_股债择时_净值'], color='royalblue',label='风险预算+股债择时(右)',lw=2.5) 
+plt.xlim([p23['超额'].dropna().index[0],p23['超额'].dropna().index[-1]]) 
+plt.ylim([0.8,2.4])
+plt.yticks([0.8,1,1.2,1.4,1.6,1.8,2.0,2.2,2.4])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图23:加入股债择时的净值')
+# 图例合并
+g = [l1, l2, l3]
+f = [l.get_label() for l in g]
+plt.legend(g,f,fontsize=9)
+plt.tight_layout()
+plt.savefig('./output/图23：加入股债择时的净值.png',dpi=800)
+#%%
+# 可视化————图24:加入股债择时的回撤
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['bottom'].set_visible(False)
+plt.plot(drawdown(p23['风险预算_净值'].dropna()),color='royalblue',lw=2.5,label='风险预算')
+plt.plot(drawdown(p23['风险预算_股债择时_净值'].dropna()),color='gold',lw=2.5,label='风险预算+股债择时')
+plt.axhline(y=0, color='black', linestyle='-', linewidth=0.9)
+plt.xlim([p23['风险预算_股债择时_净值'].dropna().index[0],p23['风险预算_股债择时_净值'].dropna().index[-1]]) 
+plt.ylim([-0.12,0])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图24:加入股债择时的回撤')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图24：加入股债择时的回撤.png',dpi=800)
+#%%
+t18 = pd.DataFrame()
+# 表18：风险预算+股债择时指标业绩表现
+t18_net = p23[['风险预算_净值','风险预算_股债择时_净值']]
+t18_net['year'] = t18_net.index.year
+y_s = t18_net.index[-1].year - t18_net.index[0].year 
+start_year = 2013
+for i in range(y_s):
+    temp_1 = t18_net[ t18_net['year'] ==  start_year]
+    # 风险预算_净值业绩表现
+    t18.loc[start_year,'收益率_风险预算股债98/2'] = Performance(temp_1['风险预算_净值']).annualized_returns
+    t18.loc[start_year,'波动率_风险预算股债98/2'] = Performance(temp_1['风险预算_净值']).annualized_volatility
+    t18.loc[start_year,'夏普_风险预算股债98/2'] = Performance(temp_1['风险预算_净值']).cal_sharp()
+    t18.loc[start_year,'最大回撤_风险预算股债98/2'] = Performance(temp_1['风险预算_净值']).max_drawdown()
+    t18.loc[start_year,'卡玛比率_风险预算股债98/2'] = Performance(temp_1['风险预算_净值']).cal_calmar()
+    # 择时加仓30%业绩表现
+    t18.loc[start_year,'收益率_择时加仓30%'] = Performance(temp_1['风险预算_股债择时_净值']).annualized_returns
+    t18.loc[start_year,'波动率_择时加仓30%'] = Performance(temp_1['风险预算_股债择时_净值']).annualized_volatility
+    t18.loc[start_year,'夏普_择时加仓30%'] = Performance(temp_1['风险预算_股债择时_净值']).cal_sharp()
+    t18.loc[start_year,'最大回撤_择时加仓30%'] = Performance(temp_1['风险预算_股债择时_净值']).max_drawdown()
+    t18.loc[start_year,'卡玛比率_择时加仓30%'] = Performance(temp_1['风险预算_股债择时_净值']).cal_calmar()    
+    start_year += 1
+
+t18.loc['区间','收益率_风险预算股债98/2'] = Performance(p23['风险预算_净值']).annualized_returns
+t18.loc['区间','波动率_风险预算股债98/2'] = Performance(p23['风险预算_净值']).annualized_volatility
+t18.loc['区间','夏普_风险预算股债98/2'] = Performance(p23['风险预算_净值']).cal_sharp()
+t18.loc['区间','最大回撤_风险预算股债98/2'] = Performance(p23['风险预算_净值']).max_drawdown()
+t18.loc['区间','卡玛比率_风险预算股债98/2'] = Performance(p23['风险预算_净值']).cal_calmar()
+
+t18.loc['区间','收益率_择时加仓30%'] = Performance(p23['风险预算_股债择时_净值']).annualized_returns
+t18.loc['区间','波动率_择时加仓30%'] = Performance(p23['风险预算_股债择时_净值']).annualized_volatility
+t18.loc['区间','夏普_择时加仓30%'] = Performance(p23['风险预算_股债择时_净值']).cal_sharp()
+t18.loc['区间','最大回撤_择时加仓30%'] = Performance(p23['风险预算_股债择时_净值']).max_drawdown()
+t18.loc['区间','卡玛比率_择时加仓30%'] = Performance(p23['风险预算_股债择时_净值']).cal_calmar()
+
+t18['相对超额'] = t18['收益率_择时加仓30%'] - t18['收益率_风险预算股债98/2']
+t18.to_excel(r'./output/表18：风险预算+股债择时指标业绩表现.xlsx')
+#%%
+"""
+5.2 风险预算+黄金择时... 32 
+    表20:1%风险预算分配给黄金，组合波动率下降明显(2012.12.31-2023.8.30)
+    表21:加入黄金择时，组合波动进一步下降，收益有所提升(2012.12.31-2023.8.30)
+    图27:黄金择时降低波动平滑收益(2012.12.31-2023.8.30)
+    图28:黄金择时回撤(2012.12.31-2023.8.30)
+"""
+# 文中没有提及，在持有股债金三种资产，同时限制股票仓位为30%后，剩下的仓位怎么分配。
+p27 = pd.concat([net_value_800['中证800每日涨跌幅'],net_value_bond['中债综合总财富指数每日涨跌幅'],net_value_au9999['上海黄金现货每日涨跌幅']],axis=1)
+# 回测月数m_s
+m_s = get_last_day(2012,2023) # 获取时间范围内每个月的最后一天并格式化成'yyyy-mm-dd'的datetime格式
+m_s = m_s[11:-1] # 去掉回测期以外的时间范围。⚠️每次调整回测期这里都需要修改！！
+p27_w = pd.DataFrame() # p5_w存储风险预算分配股债权重
+for i in m_s:
+    i_rets = p27.loc[:i,:][-60:]*100
+    cov = np.array(i_rets.cov())
+    w = risk_budgeting(cov,b=np.array([0.97,0.02,0.01]))
+    if w[0] > 0.3:
+        w[0] = 0.3 # 限制风险资产（股票）仓位<=30%
+        # 空出的仓位放在黄金上
+        w[2] = 1 - w[0] - w[1]
+    if w[2] > 0.1:
+        w[2] = 0.1
+    p27_w.loc[i,'中证800权重'] = w[0]
+    p27_w.loc[i,'中债综合总财富指数权重'] = 1 - w[0] - w[2]
+    p27_w.loc[i,'上海黄金现货权重'] = w[2]
+p27 = pd.concat([p27,p27_w,p20['合成信号多空持仓']],axis=1)
+p27[['中证800权重','中债综合总财富指数权重','上海黄金现货权重']] = p27[['中证800权重','中债综合总财富指数权重','上海黄金现货权重']].fillna(method='ffill')
+p27['合成信号多空持仓'] = p27['合成信号多空持仓'].fillna(value=0)
+# 金择时权重
+condition1 = p27['合成信号多空持仓'] == 1
+condition2 = p27['合成信号多空持仓'] == -1
+condition3 = p27['合成信号多空持仓'] == 0
+p27.loc[condition1,'上海黄金现货权重_择时'] = p27.loc[condition1,'上海黄金现货权重']+0.05#    *(1+0.05)
+p27.loc[condition2,'上海黄金现货权重_择时'] = p27.loc[condition2,'上海黄金现货权重']-0.05 #   *(1-0.05)
+p27.loc[condition3,'上海黄金现货权重_择时'] = p27.loc[condition3,'上海黄金现货权重']
+for i in p27.index:
+    if p27.loc[i,'上海黄金现货权重_择时'] > 0.1:
+        p27.loc[i,'上海黄金现货权重_择时'] = 0.1
+    elif p27.loc[i,'上海黄金现货权重_择时'] < 0:
+        p27.loc[i,'上海黄金现货权重_择时'] = 0
+p27['中债综合总财富指数权重_择时'] = p27['中债综合总财富指数权重']
+p27['中证800权重_择时'] = 1 - p27['中债综合总财富指数权重_择时'] - p27['上海黄金现货权重_择时']
+for i in p27.index:
+    if p27.loc[i,'中证800权重_择时'] > 0.3:
+        p27.loc[i,'中证800权重_择时'] = 0.3  
+p27['中债综合总财富指数权重_择时'] = 1 - p27['中证800权重_择时'] - p27['上海黄金现货权重_择时']
+p27 = p27.dropna()
+p27['风险预算'] =  p27['中证800每日涨跌幅']*p27['中证800权重']  + p27['中债综合总财富指数每日涨跌幅']*p27['中债综合总财富指数权重'] + p27['上海黄金现货每日涨跌幅']*p27['上海黄金现货权重']
+p27['风险预算_黄金择时'] = p27['中证800每日涨跌幅']*p27['中证800权重_择时']  + p27['中债综合总财富指数每日涨跌幅']*p27['中债综合总财富指数权重_择时']+ p27['上海黄金现货每日涨跌幅']*p27['上海黄金现货权重_择时']
+p27['风险预算_净值'] = 1+p27['风险预算']
+p27.loc['2012-12-31','风险预算_净值'] = 1
+p27['风险预算_净值'] = p27['风险预算_净值'].cumprod()
+p27['风险预算_黄金择时_净值'] = 1+p27['风险预算_黄金择时']
+p27.loc['2012-12-31','风险预算_黄金择时_净值'] = 1
+p27['风险预算_黄金择时_净值'] = p27['风险预算_黄金择时_净值'].cumprod()
+#%%
+# 可视化————图27:黄金择时降低波动平滑收益
+fig, ax1 = plt.subplots(figsize=(8,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+plt.plot(p27['风险预算_净值'], color='midnightblue',label='风险预算',lw=2.5) 
+plt.plot(p27['风险预算_黄金择时_净值'], color='gold',label='风险预算+黄金择时',lw=2.5) 
+plt.xlim([p27['风险预算_黄金择时_净值'].dropna().index[0],p27['风险预算_黄金择时_净值'].dropna().index[-1]]) 
+plt.ylim([0.8,2])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图27:黄金择时降低波动平滑收益')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图27：黄金择时降低波动平滑收益.png',dpi=800)
+#%%
+# 可视化————图28:黄金择时回撤
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['bottom'].set_visible(False)
+plt.plot(drawdown(p27['风险预算_净值'].dropna()),color='royalblue',label='风险预算',lw=2.5)
+plt.plot(drawdown(p27['风险预算_黄金择时_净值'].dropna()),color='gold',label='风险预算+黄金择时',lw=2.5)
+plt.axhline(y=0, color='black', linestyle='-', linewidth=1)
+plt.xlim([p27['风险预算_黄金择时_净值'].dropna().index[0],p27['风险预算_黄金择时_净值'].dropna().index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图28:黄金择时回撤')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图28：黄金择时回撤.png',dpi=800)
+#%%
+# 表20:1%风险预算分配给黄金，组合波动率下降明显
+""" 波动率下降不明显"""
+t20 = t18.iloc[:,:5]
+t20_net = p27[['风险预算_净值','风险预算_黄金择时_净值']]
+t20_net['year'] = t20_net.index.year
+y_s = t20_net.index[-1].year - t20_net.index[0].year 
+start_year = 2013
+for i in range(y_s):
+    temp_1 = t20_net[ t20_net['year'] ==  start_year]
+    # 风险预算股债金97/2/1业绩表现
+    t20.loc[start_year,'收益率_风险预算股债金97/2/1'] = Performance(temp_1['风险预算_净值']).annualized_returns
+    t20.loc[start_year,'波动率_风险预算股债金97/2/1'] = Performance(temp_1['风险预算_净值']).annualized_volatility
+    t20.loc[start_year,'夏普_风险预算股债金97/2/1'] = Performance(temp_1['风险预算_净值']).cal_sharp()
+    t20.loc[start_year,'最大回撤_风险预算股债金97/2/1'] = Performance(temp_1['风险预算_净值']).max_drawdown()
+    t20.loc[start_year,'卡玛比率_风险预算股债金97/2/1'] = Performance(temp_1['风险预算_净值']).cal_calmar()    
+    start_year += 1
+t20.loc['区间','收益率_风险预算股债金97/2/1'] = Performance(p27['风险预算_净值']).annualized_returns
+t20.loc['区间','波动率_风险预算股债金97/2/1'] = Performance(p27['风险预算_净值']).annualized_volatility
+t20.loc['区间','夏普_风险预算股债金97/2/1'] = Performance(p27['风险预算_净值']).cal_sharp()
+t20.loc['区间','最大回撤_风险预算股债金97/2/1'] = Performance(p27['风险预算_净值']).max_drawdown()
+t20.loc['区间','卡玛比率_风险预算股债金97/2/1'] = Performance(p27['风险预算_净值']).cal_calmar()
+t20['波动率_相对变动'] = t20['波动率_风险预算股债金97/2/1'] - t20['波动率_风险预算股债98/2']
+t20.to_excel(r'./output/表20：1%风险预算分配给黄金，组合波动率下降明显.xlsx')
+#%%
+# 表21:加入黄金择时，组合波动进一步下降，收益有所提升
+t21 =  t20.iloc[:,5:10] 
+start_year = 2013
+for  i in range(y_s):
+    temp_1 = t20_net.loc[ t20_net['year'] ==  start_year,:]
+    # 风险预算股债金97/2/1业绩表现
+    t21.loc[start_year,'收益率_风险预算股债金97/2/1+黄金择时'] = Performance(temp_1['风险预算_黄金择时_净值']).annualized_returns
+    t21.loc[start_year,'波动率_风险预算股债金97/2/1+黄金择时'] = Performance(temp_1['风险预算_黄金择时_净值']).annualized_volatility
+    t21.loc[start_year,'夏普_风险预算股债金97/2/1+黄金择时'] = Performance(temp_1['风险预算_黄金择时_净值']).cal_sharp()
+    t21.loc[start_year,'最大回撤_风险预算股债金97/2/1+黄金择时'] = Performance(temp_1['风险预算_黄金择时_净值']).max_drawdown()
+    t21.loc[start_year,'卡玛比率_风险预算股债金97/2/1+黄金择时'] = Performance(temp_1['风险预算_黄金择时_净值']).cal_calmar()    
+    start_year += 1
+
+t21.loc['区间','收益率_风险预算股债金97/2/1+黄金择时'] = Performance(p27['风险预算_黄金择时_净值']).annualized_returns
+t21.loc['区间','波动率_风险预算股债金97/2/1+黄金择时'] = Performance(p27['风险预算_黄金择时_净值']).annualized_volatility
+t21.loc['区间','夏普_风险预算股债金97/2/1+黄金择时'] = Performance(p27['风险预算_黄金择时_净值']).cal_sharp()
+t21.loc['区间','最大回撤_风险预算股债金97/2/1+黄金择时'] = Performance(p27['风险预算_黄金择时_净值']).max_drawdown()
+t21.loc['区间','卡玛比率_风险预算股债金97/2/1+黄金择时'] = Performance(p27['风险预算_黄金择时_净值']).cal_calmar()
+
+t21['相对超额'] = t21['波动率_风险预算股债金97/2/1+黄金择时'] - t21['波动率_风险预算股债金97/2/1']
+t21.to_excel(r'./output/表21：加入黄金择时，组合波动进一步下降，收益有所提升.xlsx')
+#%%
+"""
+5.3 风险预算+股债+黄金择时 33 
+    图29:组合净值(2012.12.31-2023.8.30)
+    图30:组合回撤(2012.12.31-2023.8.30)
+    表23：固定比例->风险预算->加入择时的风险预算组合年度业绩(2012.12.31-2023.8.30)
+"""
+p29 = pd.concat([net_value_800['中证800每日涨跌幅'],net_value_bond[['中债综合总财富指数每日涨跌幅']],net_value_au9999[['Au','上海黄金现货每日涨跌幅']],p27[['中证800权重','中债综合总财富指数权重','上海黄金现货权重']],p8[['加权ERP']],volume_800[['成交量M='+str(M),'中证800成交量']],p9[['close','MA_close']],tips_vix,p20[['美债均线MA【20】','VIX【15天，MAX】','黄金价格动量【250】']]],axis=1)
+"""构建信号"""
+# 股债择时
+# 加权ERP信号
+p29.loc[p29['加权ERP'] > up,'加权ERP信号signal'] = 1
+p29.loc[p29['加权ERP'] < down,'加权ERP信号signal'] = -1
+p29['加权ERP信号signal'] = p29['加权ERP信号signal'].fillna(value=0)
+# 量价信号
+p29.loc[(p29['close'] > p29['MA_close']) & (p29['中证800成交量'] > p29['成交量M='+str(M)]),'量价信号signal'] = 1
+p29.loc[p29['close'] < p29['MA_close'],'量价信号signal'] = -1
+p29['量价信号signal'] = p29['量价信号signal'].fillna(value=0) 
+# 信号结合
+p29['股债signal'] = p29['加权ERP信号signal'] + p29['量价信号signal']
+# 黄金择时
+p29.loc[p29['TIPS收益率'] < p29['美债均线MA【20】'],'美债均线MA【20】signal' ] = 1
+p29.loc[p29['TIPS收益率'] > p29['美债均线MA【20】'],'美债均线MA【20】signal' ] = -1
+p29.loc[p29['VIX【15天，MAX】'] > 20,'VIX【15天，MAX】signal'] = 1
+p29.loc[p29['黄金价格动量【250】'] > 0,'黄金价格动量【250】signal'] = 1
+# 信号结合
+p29['金signal'] = 0
+for i in combine_list:
+    p29[i+'signal'] = p29[i+'signal'].fillna(value=0)
+    p29['金signal'] += p29[i+'signal']
+# 找出调仓日——每月最后一个交易日
+p29['date']=p29.index
+p29['yyyymm'] = p29.index.strftime('%Y-%m')
+resize_list_tactics = p29['date'].groupby(p29['yyyymm']).last()
+# 建仓信号
+for i in resize_list_tactics:
+    # 股债（多空）
+    if p29.loc[i,'股债signal'] >= 2:
+        p29.loc[i,'股债多空建仓te'] = 1
+    elif p29.loc[i,'股债signal'] <= -2:
+        p29.loc[i,'股债多空建仓te'] = -1
+    else:
+        p29.loc[i,'股债多空建仓te'] = 0
+    # 金（多空
+    if p29.loc[i,'金signal'] >= 2:
+        p29.loc[i,'金多空建仓te'] = 1
+    elif p29.loc[i,'金signal'] < 0:
+        p29.loc[i,'金多空建仓te'] = -1
+    else:
+        p29.loc[i,'金多空建仓te'] = 0
+p29['股债多空建仓'] = p29['股债多空建仓te'].shift(1)
+p29['金多空建仓'] = p29['金多空建仓te'].shift(1)
+p29['股债多空建仓']  = p29['股债多空建仓'].fillna(method='ffill')
+p29['金多空建仓'] = p29['金多空建仓'].fillna(method='ffill')
+# 持仓
+p29.loc[p29['股债多空建仓']==1,'股债多空持仓'] = 1
+p29.loc[p29['股债多空建仓']==-1,'股债多空持仓'] = -1
+p29.loc[p29['股债多空建仓']==0,'股债多空持仓'] = 0
+p29.loc[p29['金多空建仓']==1,'金多空持仓'] = 1
+p29.loc[p29['金多空建仓']==-1,'金多空持仓'] = -1
+p29.loc[p29['金多空建仓']==0,'金多空持仓'] = 0
+# 股债择时权重
+p29.loc[p29['股债多空持仓']==1,'中证800权重_择时'] = 0.3#p29.loc[p29['股债多空持仓']==0,'中证800权重']*(1+0.3)
+p29.loc[p29['股债多空持仓']==-1,'中证800权重_择时'] = 0#p29.loc[p29['股债多空持仓']==0,'中证800权重']*(1-0.3)
+p29.loc[p29['股债多空持仓']==0,'中证800权重_择时'] = p29.loc[p29['股债多空持仓']==0,'中证800权重']
+# 金择时权重
+p29.loc[p29['金多空持仓']==1,'上海黄金现货权重_择时'] = p29.loc[p29['金多空持仓']==1,'上海黄金现货权重']+0.05
+p29.loc[p29['金多空持仓']==-1,'上海黄金现货权重_择时'] = p29.loc[p29['金多空持仓']==-1,'上海黄金现货权重']-0.05
+p29.loc[p29['金多空持仓']==0,'上海黄金现货权重_择时'] = p29.loc[p29['金多空持仓']==0,'上海黄金现货权重']
+for i in p29.index:
+    if p29.loc[i,'中证800权重_择时'] > 0.3:
+        p29.loc[i,'中证800权重_择时'] = 0.3
+    if p29.loc[i,'中证800权重_择时'] < 0:
+        p29.loc[i,'中证800权重_择时'] = 0
+    if p29.loc[i,'上海黄金现货权重_择时'] > 0.1:
+        p29.loc[i,'上海黄金现货权重_择时'] = 0.1
+    elif p29.loc[i,'上海黄金现货权重_择时'] < 0:
+        p29.loc[i,'上海黄金现货权重_择时'] = 0
+p29['中债综合总财富指数权重_择时'] = 1 - p29['中证800权重_择时'] - p27['上海黄金现货权重_择时']
+p29 = p29[['中证800每日涨跌幅','中债综合总财富指数每日涨跌幅','上海黄金现货每日涨跌幅','中证800权重','中债综合总财富指数权重','上海黄金现货权重','中证800权重_择时','中债综合总财富指数权重_择时','上海黄金现货权重_择时']]
+p29 = p29.dropna()
+# 净值计算
+p29['固定比例_涨跌幅'] =  p29['中证800每日涨跌幅'] * 0.15  + p29['中债综合总财富指数每日涨跌幅'] * 0.8 + p29['上海黄金现货每日涨跌幅']* 0.05
+p29['风险预算_涨跌幅'] =  p29['中证800每日涨跌幅']*p29['中证800权重']  + p29['中债综合总财富指数每日涨跌幅'] * p29['中债综合总财富指数权重'] + p29['上海黄金现货每日涨跌幅']*p29['上海黄金现货权重']
+p29['风险预算_战术择时_涨跌幅'] = p29['中证800每日涨跌幅']*p29['中证800权重_择时']  + p29['中债综合总财富指数每日涨跌幅']*p29['中债综合总财富指数权重_择时'] + p29['上海黄金现货每日涨跌幅']*p29['上海黄金现货权重_择时']
+p29['固定比例_净值'] = (1+p29['固定比例_涨跌幅']).cumprod()
+p29['风险预算_净值'] = (1+p29['风险预算_涨跌幅']).cumprod()
+p29['风险预算_战术择时_净值'] = (1+p29['风险预算_战术择时_涨跌幅']).cumprod()
+# 可视化————图29:组合净值
+fig, ax1 = plt.subplots(figsize=(8,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+plt.plot(p29['固定比例_净值'], color='mediumblue',label='固定比例',lw=2.5) 
+plt.plot(p29['风险预算_净值'], color='royalblue',label='风险预算',lw=2.5) 
+plt.plot(p29['风险预算_战术择时_净值'], color='gold',label='风险预算（加入战术择时）',lw=2.5) 
+plt.xlim([p29['风险预算_战术择时_净值'].dropna().index[0],p29['风险预算_战术择时_净值'].dropna().index[-1]]) 
+plt.ylim([0.8,2.4])
+plt.yticks([0.8,1,1.2,1.4,1.6,1.8,2,2.2,2.4])
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图29:组合净值')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图29：组合净值.png',dpi=800)
+
+#%%
+# 可视化————图30:组合回撤
+fig, ax1 = plt.subplots(figsize=(9,4))
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['bottom'].set_visible(False)
+plt.plot(drawdown(p29['固定比例_净值'].dropna()),color='mediumblue',label='固定比例',lw=2.5)
+plt.plot(drawdown(p29['风险预算_净值'].dropna()),color='royalblue',label='风险预算',lw=2.5)
+plt.plot(drawdown(p29['风险预算_战术择时_净值'].dropna()),color='gold',label='风险预算（加入战术择时）',lw=2.5)
+plt.axhline(y=0, color='black', linestyle='-', linewidth=1)
+plt.xlim([p29['风险预算_战术择时_净值'].dropna().index[0],p29['风险预算_战术择时_净值'].dropna().index[-1]]) 
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x) # 设定x轴datetime显示格式
+plt.xticks(rotation=30)
+plt.xticks([dt.datetime(2012+j,12,31) for j in range(11)])
+plt.title('图30:组合回撤')
+plt.legend()
+plt.tight_layout()
+plt.savefig('./output/图30：组合回撤.png',dpi=800)
+#%%
+# 表23:固定比例->风险预算->加入择时的风险预算组合年度业绩
+t23 =  pd.DataFrame()
+t23_net = p29[['固定比例_净值','风险预算_净值','风险预算_战术择时_净值']]
+t23_net['year'] = t23_net.index.year
+y_s = t23_net.index[-1].year - t23_net.index[0].year 
+start_year = 2013
+for  i in range(y_s):
+    temp_1 = t23_net.loc[ t23_net['year'] ==  start_year,:]
+    for j in t23_net.columns[:3]:
+        # 风险预算股债金97/2/1业绩表现
+        t23.loc[start_year,'收益率_'+j[:-3]] = Performance(temp_1[j]).annualized_returns
+        t23.loc[start_year,'波动率_'+j[:-3]] = Performance(temp_1[j]).annualized_volatility
+        t23.loc[start_year,'夏普_'+j[:-3]] = Performance(temp_1[j]).cal_sharp()
+        t23.loc[start_year,'最大回撤_'+j[:-3]] = Performance(temp_1[j]).max_drawdown()
+        t23.loc[start_year,'卡玛比率_'+j[:-3]] = Performance(temp_1[j]).cal_calmar()    
+    start_year += 1
+for j in t23_net.columns[:3]:
+    t23.loc['区间','收益率_'+j[:-3]] = Performance(p29[j]).annualized_returns
+    t23.loc['区间','波动率_'+j[:-3]] = Performance(p29[j]).annualized_volatility
+    t23.loc['区间','夏普_'+j[:-3]] = Performance(p29[j]).cal_sharp()
+    t23.loc['区间','最大回撤_'+j[:-3]] = Performance(p29[j]).max_drawdown()
+    t23.loc['区间','卡玛比率_'+j[:-3]] = Performance(p29[j]).cal_calmar()
+t23.to_excel(r'./output/表23：固定比例->风险预算->加入择时的风险预算组合年度业绩.xlsx')
+
+
+
+
+
+
+
+
+
+
