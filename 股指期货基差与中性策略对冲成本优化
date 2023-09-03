@@ -1,0 +1,481 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime,timedelta
+plt.rcParams['font.sans-serif']=['SimHei']
+plt.rcParams['axes.unicode_minus']=False
+import matplotlib.ticker as ticker
+import statsmodels.api as sm #导入StatsModels的子模块api
+import rqdatac as rq
+from rqdatac import *
+rq.init('license','grrTNo3dkZWxmjibcJABj8wmoUNJ89n_seBVWr4d-_yB3JA07t616Yv9ZHjHMlOTm73t0519OK_Daivudx8Qdy3G5McI1FH7ple9Iay7zEllwtY8VUyQgP18KKEXJdI3_jltVHzMHscWXrR7J0L2aNf1pmQUzTNjlAcqHKgVktk=PVnor5Ki58fMcZO7JtP5CaRVdqy1ppGXZC6pRzLYYDlfEJcHb59VBF7UHXAxaKM-li40ge27Ay15ZOKmCidH6f-5QJlhn6PDL1iUhrmY7-HfOmxUjsvaYXQ_9eBCRVo5UpPrNy7qHR7-9g72A9tgZrGJYGPfWNtywPD9Y1g-oKg=')
+rq.user.get_quota()
+# 注意⚠️ 账号可能过期，使得无法获取数据进而出错
+"""函数定义"""
+def get_3rd_friday(year=23,month=7):
+    """
+    input：year——年份 ,month——月份
+    output：获取对应年月的第三个星期五
+    """
+    year = 2000 + year
+    import calendar
+    c = calendar.Calendar(firstweekday=calendar.SUNDAY)
+    monthcal = c.monthdatescalendar(year,month)
+    third_friday = [day for week in monthcal for day in week if day.weekday() == calendar.FRIDAY and day.month == month][2]
+    return pd.to_datetime(third_friday)
+def curent_ar_bs(f_price,s_price,dd):
+    """
+    input：f_price——期货价格（收盘价）；s_price——现货价格；dd——期货剩余到期日
+    output：当前年化基差
+    """
+    return (f_price - s_price)/s_price*360/dd
+class Performance():
+    """业绩指标
+    input：净值序列
+    """
+    def __init__(self,net_value:np.ndarray,period=360,rf=0.02):
+        self.net_value = net_value.dropna()
+        self.period = period
+        self.rf = rf # 年化无风险收益
+        self.daily_returns = self.net_value/self.net_value.shift(1) -1
+        # 计算年华收益率annualized_returns
+        self.annualized_returns = round(100*((self.net_value[-1]-self.net_value[0])/self.net_value[0]) * self.period/((self.net_value.index[-1] - self.net_value.index[-0])/ timedelta(days=1)),2)
+        self.annualized_volatility = round(100*np.sqrt(self.period) * np.std(self.daily_returns),2) # 计算年化波动率
+    def max_drawdown(self):
+        """
+        计算最大回撤"""
+        max_drawdown = 0
+        # 获取投资组合的历史最高点
+        low = np.argmax(np.maximum.accumulate(self.net_value.values) - np.array(self.net_value.values)) # 最大回撤结束的位置 最低的那个位置
+        if low == 0:
+            high = 0
+        else:
+            high = np.argmax(self.net_value.values[:low]) # 最大回撤开始的位置 最高点
+        max_drawdown = (self.net_value.values[low] - self.net_value.values[high] ) / self.net_value.values[high] # 最大回撤率
+        return round(max_drawdown*100,2)
+    def cal_sharp(self):
+        """计算夏普比率：(投资组合年化收益率 - 年化无风险收益) / 投资组合年化波动率"""
+        Er = self.annualized_returns - self.rf
+        sharp = Er / self.annualized_volatility
+        return sharp
+"""获取期货当月、季月、次月和次季月合约代码并保存本地"""
+# start_date= '20180101'
+# end_date= '20230730'
+# # 获取交易日列表
+# trading_list = get_trading_dates(start_date, end_date, market='cn')
+# IC_date = pd.DataFrame()
+# sm_date = pd.DataFrame()
+# for i in  trading_list:
+#     sm_ctr = rq.futures.get_contracts('IC', i)
+#     sm_date.loc[i,'季月合约'] = sm_ctr[2][-4:]
+#     IC_date.loc[i,'当月合约'] = sm_ctr[0]
+#     IC_date.loc[i,'次月合约'] = sm_ctr[1]
+#     IC_date.loc[i,'季月合约'] = sm_ctr[2]
+#     IC_date.loc[i,'次季月合约'] = sm_ctr[3]
+# sm_date.to_csv('季月合约.csv',encoding='gbk')
+# IC_date.to_csv('IC不同月份上市交易的股指期货合约列表.csv',encoding='gbk')
+'''图 1：股指期货市场各品种持仓量变动图'''
+IC_v = pd.read_excel(r"图1：股指期货市场各品种持仓量变动图.xlsx",sheet_name='IC',index_col=0, skiprows=2)
+IC_v = IC_v.iloc[1:,:]
+IC_v.fillna(value=0,inplace=True)
+IC_v['中证500总持仓量'] = IC_v.sum(axis=1)
+# IC_v.index = pd.to_datetime(IC_v.index)
+IF_v =  pd.read_excel(r"图1：股指期货市场各品种持仓量变动图.xlsx",sheet_name='IF',index_col=0, skiprows=2)
+IF_v = IF_v.iloc[1:,:]
+IF_v.fillna(value=0,inplace=True)
+IF_v['沪深300总持仓量'] = IF_v.sum(axis=1)
+# IF_v.index = pd.to_datetime(IF_v.index)
+IH_v =  pd.read_excel(r"图1：股指期货市场各品种持仓量变动图.xlsx",sheet_name='IH',index_col=0, skiprows=2)
+IH_v = IH_v.iloc[1:,:]
+IH_v.fillna(value=0,inplace=True)
+IH_v['上证50总持仓量'] = IH_v.sum(axis=1)
+# IH_v.index = pd.to_datetime(IH_v.index)
+# 可视化
+from matplotlib.dates import DateFormatter
+fig, ax = plt.subplots()
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.plot(IC_v['中证500总持仓量'], c = 'darkred', linewidth=2, label='中证500总持仓量 ')
+plt.plot(IF_v['沪深300总持仓量'], c = 'lightcoral', linewidth=2, label='沪深300总持仓量 ')
+plt.plot(IH_v['上证50总持仓量'] , c = 'rosybrown', linewidth=2, label='上证50总持仓量 ')
+plt.xticks(rotation=30)
+# plt.xlabel('日期')
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.ylabel('持仓量（张）')
+plt.title('图1：股指期货市场各品种持仓量变动图')
+plt.legend()
+# plt.grid()
+plt.tight_layout()
+plt.savefig('图1：股指期货市场各品种持仓量变动图.png',dpi=800)
+'''图 2：季月股指期货合约各品种年化基差变动图'''
+# 读取季月合约
+sm_date = pd.read_csv('季月合约.csv',encoding='gbk')
+sm_date.set_index(sm_date.iloc[:,0],inplace=True)
+sm_date.index = pd.to_datetime(sm_date.index)
+# 合成各品种季月合约
+sm_date['季月合约'] = sm_date['季月合约'].apply(lambda x:str(x))
+sm_date['IC'] = 'IC' 
+sm_date['IF'] = 'IF'
+sm_date['IH'] = 'IH'
+sm_date['IC季月合约'] = sm_date[['IC','季月合约']].apply(lambda x:''.join(x),axis=1)
+sm_date['IF季月合约'] = sm_date[['IF','季月合约']].apply(lambda x:''.join(x),axis=1)
+sm_date['IH季月合约'] = sm_date[['IH','季月合约']].apply(lambda x:''.join(x),axis=1)
+from datetime import datetime
+# 季月合约期货价格
+p2_IC = pd.read_excel(r"图 2：季月股指期货合约各品种年化基差变动图.xlsx",sheet_name='IC',index_col=0, skiprows=2)
+p2_IC = p2_IC.iloc[1:,:]
+# p2_IC.index = pd.to_datetime(p2_IC.index)
+p2_IC = pd.concat([p2_IC,sm_date['IC季月合约']],axis=1,join='inner')
+for j in range(len(p2_IC.columns)-1):
+    p2_IC.loc[p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].loc[:,p2_IC.columns[j]].index,'IC_sm'] = p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].loc[:,p2_IC.columns[j]]
+    p2_IC.loc[p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].loc[:,p2_IC.columns[j]].index,'IC季月合约剩余天数']= (get_3rd_friday(year=int(p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].columns[j][-4:-2]),month=int(p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].columns[j][-2:])) -p2_IC[p2_IC['IC季月合约']==p2_IC.columns[j]].loc[:,p2_IC.columns[j]].index).astype('timedelta64[D]').astype(float)
+p2_IF = pd.read_excel(r"图 2：季月股指期货合约各品种年化基差变动图.xlsx",sheet_name='IF',index_col=0, skiprows=2)
+p2_IF = p2_IF.iloc[1:,:]
+p2_IF.index = pd.to_datetime(p2_IF.index)
+p2_IF = pd.concat([p2_IF,sm_date['IF季月合约']],axis=1,join='inner')
+for j in range(len(p2_IF.columns)-1):
+    p2_IF.loc[p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].loc[:,p2_IF.columns[j]].index,'IF_sm'] = p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].loc[:,p2_IF.columns[j]]
+    p2_IF.loc[p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].loc[:,p2_IF.columns[j]].index,'IF季月合约剩余天数']= (get_3rd_friday(year=int(p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].columns[j][-4:-2]),month=int(p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].columns[j][-2:])) -p2_IF[p2_IF['IF季月合约']==p2_IF.columns[j]].loc[:,p2_IF.columns[j]].index).astype('timedelta64[D]').astype(float)
+p2_IH = pd.read_excel(r"图 2：季月股指期货合约各品种年化基差变动图.xlsx",sheet_name='IH',index_col=0, skiprows=2)
+p2_IH = p2_IH.iloc[1:,:]
+p2_IH.index = pd.to_datetime(p2_IH.index)
+p2_IH = pd.concat([p2_IH,sm_date['IH季月合约']],axis=1,join='inner')
+for j in range(len(p2_IH.columns)-1):
+    p2_IH.loc[p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].loc[:,p2_IH.columns[j]].index,'IH_sm'] = p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].loc[:,p2_IH.columns[j]]
+    p2_IH.loc[p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].loc[:,p2_IH.columns[j]].index,'IH季月合约剩余天数']= (get_3rd_friday(year=int(p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].columns[j][-4:-2]),month=int(p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].columns[j][-2:])) -p2_IH[p2_IH['IH季月合约']==p2_IH.columns[j]].loc[:,p2_IH.columns[j]].index).astype('timedelta64[D]').astype(float)
+# 现货价格
+index=pd.read_excel(r"图 2：季月股指期货合约各品种年化基差变动图.xlsx",sheet_name='Sheet1',index_col=0, skiprows=2)
+index = index.iloc[1:,:]
+# 合并期货合约价格与相应标的指数价格
+p2_IC = pd.concat([p2_IC,index['中证500']],axis=1,join='inner')
+p2_IF = pd.concat([p2_IF,index['沪深300']],axis=1,join='inner')
+p2_IH = pd.concat([p2_IH,index['上证50']],axis=1,join='inner')
+# 计算年化基差
+p2_IC['年化基差'] = curent_ar_bs(p2_IC['IC_sm'],p2_IC['中证500'], p2_IC['IC季月合约剩余天数'])
+p2_IF['年化基差'] = curent_ar_bs(p2_IF['IF_sm'],p2_IF['沪深300'], p2_IF['IF季月合约剩余天数'])
+p2_IH['年化基差'] = curent_ar_bs(p2_IH['IH_sm'],p2_IH['上证50'], p2_IH['IH季月合约剩余天数'])
+# 可视化
+fig, ax = plt.subplots(figsize=(10,5))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.axhline(y=0, color='gainsboro', linestyle='--', linewidth=2)
+plt.plot(p2_IC['年化基差'],linewidth=2, c = 'darkred', label='中证500季月基差 ')
+plt.plot(p2_IF['年化基差'],linewidth=2, c = 'lightcoral', label='沪深300季月基差 ')
+plt.plot(p2_IH['年化基差'],linewidth=2, c = 'rosybrown', label='上证50季月基差 ')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+
+plt.gca().xaxis.set_major_formatter(x)
+plt.gca().yaxis.set_major_formatter(ticker.PercentFormatter(1))
+
+plt.title('图 2：季月股指期货合约各品种年化基差变动图')
+plt.legend()
+plt.tight_layout()
+# plt.grid()
+plt.savefig('图 2：季月股指期货合约各品种年化基差变动图.png',dpi=800)
+
+"""图 3：中证 500 股指期货各合约年化基差变动图"""
+code_list =  pd.read_csv('IC不同月份上市交易的股指期货合约列表.csv',encoding='gbk')#
+code_list.set_index(code_list.iloc[:,0],inplace=True)
+code_list.index = pd.to_datetime(code_list.index)
+p3 = pd.read_excel(r"图 3：中证 500 股指期货各合约年化基差变动图.xlsx",sheet_name='Sheet1',index_col=0, skiprows=2)
+p3 = p3.iloc[1:,:]
+# p3.index = pd.to_datetime(p3.index)
+# IC当月合约基差
+p3_cm = pd.concat([p3,code_list['当月合约']],axis=1,join='inner')
+for i in range(len(p3_cm['当月合约'])):
+    p3_cm.loc[p3_cm.index[i],'当月合约期货价格'] = p3_cm.loc[p3_cm.index[i],p3_cm['当月合约'][i]]
+    p3_cm.loc[p3_cm.index[i],'当月合约剩余天数'] = instruments(p3_cm['当月合约'][i]).days_to_expire(p3_cm.index[i])
+# 去掉当月合约剩余天数为0的合约 
+p3_cm_dropna = p3_cm[p3_cm['当月合约剩余天数'] != 0]
+# IC次月合约基差
+p3_nm = pd.concat([p3,code_list['次月合约']],axis=1,join='inner')
+for i in range(len(p3_nm['次月合约'])):
+    p3_nm.loc[p3_nm.index[i],'次月合约期货价格'] = p3_nm.loc[p3_nm.index[i],p3_nm['次月合约'][i]]
+    p3_nm.loc[p3_nm.index[i],'次月合约剩余天数'] = instruments(p3_nm['次月合约'][i]).days_to_expire(p3_nm.index[i])
+# IC季月合约基差
+p3_sm = pd.concat([p3,code_list['季月合约']],axis=1,join='inner')
+for i in range(len(p3_sm['季月合约'])):
+    p3_sm.loc[p3_sm.index[i],'季月合约期货价格'] = p3_sm.loc[p3_sm.index[i],p3_sm['季月合约'][i]]
+    p3_sm.loc[p3_sm.index[i],'季月合约剩余天数'] = instruments(p3_sm['季月合约'][i]).days_to_expire(p3_sm.index[i])
+# IC下季月合约基差
+p3_nsm = pd.concat([p3,code_list['次季月合约']],axis=1,join='inner')
+for i in range(len(p3_nsm['次季月合约'])):
+    p3_nsm.loc[p3_nsm.index[i],'次季月合约期货价格'] = p3_nsm.loc[p3_nsm.index[i],p3_nsm['次季月合约'][i]]
+    p3_nsm.loc[p3_nsm.index[i],'次季月合约剩余天数'] = instruments(p3_nsm['次季月合约'][i]).days_to_expire(p3_nsm.index[i])
+# 合并现货价格
+p3_cm_dropna = pd.concat([p3_cm_dropna,index['中证500']],axis=1,join='inner')
+p3_nm = pd.concat([p3_nm,index['中证500']],axis=1,join='inner')
+p3_sm = pd.concat([p3_sm,index['中证500']],axis=1,join='inner')
+p3_nsm = pd.concat([p3_nsm,index['中证500']],axis=1,join='inner')
+# 计算年化基差
+p3_cm_dropna['当月合约年化基差'] = curent_ar_bs(p3_cm_dropna['当月合约期货价格'],p3_cm_dropna['中证500'], p3_cm_dropna['当月合约剩余天数'])
+p3_nm['次月合约年化基差'] = curent_ar_bs(p3_nm['次月合约期货价格'],p3_nm['中证500'], p3_nm['次月合约剩余天数'])
+p3_sm['季月合约年化基差'] = curent_ar_bs(p3_sm['季月合约期货价格'],p3_sm['中证500'], p3_sm['季月合约剩余天数'])
+p3_nsm['次季月合约年化基差'] = curent_ar_bs(p3_nsm['次季月合约期货价格'],p3_nsm['中证500'], p3_nsm['次季月合约剩余天数'])
+# 可视化
+fig, ax = plt.subplots(figsize=(10,5))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.axhline(y=0, color='gainsboro', linestyle='--', linewidth=2)
+plt.plot(p3_nm['次月合约年化基差'],linewidth=2, c = 'darkred', label='次月合约年化基差 ')
+plt.plot(p3_sm['季月合约年化基差'],linewidth=2, c = 'lightcoral', label='季月合约年化基差 ')
+plt.plot(p3_nsm['次季月合约年化基差'],linewidth=2, c = 'rosybrown', label='次季月合约年化基差 ')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.gca().yaxis.set_major_formatter(ticker.PercentFormatter(1))
+plt.title('图 3：中证 500 股指期货各合约年化基差变动图')
+plt.legend()
+plt.tight_layout()
+plt.savefig('图 3：中证 500 股指期货各合约年化基差变动图.png',dpi=800)
+
+"""连续对冲策略回测"""
+ETF510500 = pd.read_excel(r"510500ETF.xlsx",sheet_name='Sheet1',index_col=0, skiprows=2)
+ETF510500 = ETF510500.iloc[1:,:]
+# ETF510500.index = pd.to_datetime(ETF510500.index)
+ETF510500['涨跌幅'] = ETF510500['收盘价'] / ETF510500['收盘价'].shift(1) -1
+ETF510500['净值'] = 1+ETF510500['涨跌幅']
+ETF510500['净值'][0] = 1
+ETF510500['净值'] = ETF510500['净值'].cumprod()
+ETF510500
+
+"""图 4：中证 500 股指期货连续对冲策略净值"""
+# 连续持有当月合约
+sgy_cm = pd.concat([p3_cm,p3_nm],axis=1)
+sgy_cm = sgy_cm[['当月合约','当月合约期货价格','当月合约剩余天数','次月合约','次月合约期货价格','次月合约剩余天数']]#'收盘价','当月合约年化基差','次月合约年化基差',
+condition = sgy_cm['当月合约剩余天数'] == 1
+sgy_cm.loc[condition,'开仓信号'] = 1
+sgy_cm['调整'] = sgy_cm['开仓信号'].shift(1)
+sgy_cm.loc[ sgy_cm['当月合约剩余天数'] >= 1,'当月合约价格拼接']= sgy_cm['当月合约期货价格']
+sgy_cm['当月合约价格拼接'] = sgy_cm['当月合约价格拼接'].fillna(value=sgy_cm['次月合约期货价格'])
+sgy_cm['当月合约涨跌幅'] = sgy_cm['当月合约价格拼接'] / sgy_cm['当月合约价格拼接'].shift(1) - 1
+sgy_cm.loc[ sgy_cm['调整'] ==  1, '当月合约涨跌幅'] = sgy_cm['当月合约价格拼接'] / sgy_cm['次月合约期货价格'].shift(1) - 1
+sgy_cm['期货端净值'] = (1 - sgy_cm['当月合约涨跌幅']).cumprod()
+sgy_cm['期货端净值'][0] = 1
+sgy_cm.head(30)
+# 连续持有季月合约
+# 季月合约拼接，至该合约离到期剩余不足 2 日
+sgy_sm =pd.concat([p3_sm,p3_nsm],axis=1)
+sgy_sm = sgy_sm[['季月合约','季月合约期货价格','季月合约剩余天数','次季月合约','次季月合约期货价格','次季月合约剩余天数']]
+condition = sgy_sm['季月合约'] != sgy_sm['季月合约'].shift(1)
+sgy_sm.loc[condition,'调整'] = 1
+sgy_sm['季月合约涨跌幅'] = sgy_sm['季月合约期货价格'] / sgy_sm['季月合约期货价格'].shift(1) - 1
+sgy_sm['次季月合约期货价格shift1'] = sgy_sm['次季月合约期货价格'].shift(1)
+sgy_sm.loc[condition,'季月合约涨跌幅']  = sgy_sm.loc[condition ,'季月合约期货价格'] / sgy_sm.loc[condition ,'次季月合约期货价格shift1'] - 1
+sgy_sm['期货端净值'] = (1 - sgy_sm['季月合约涨跌幅']).cumprod()
+sgy_sm['期货端净值'][0] = 1
+
+# 可视化图 4
+cm_copy = pd.concat([sgy_cm['当月合约涨跌幅'], ETF510500['涨跌幅']],axis=1)
+sm_copy = pd.concat([sgy_sm['季月合约涨跌幅'], ETF510500['涨跌幅']],axis=1)
+cm_copy['合并涨跌幅'] = (cm_copy['涨跌幅']-cm_copy['当月合约涨跌幅'])/2
+sm_copy['合并涨跌幅'] = (sm_copy['涨跌幅']-sm_copy['季月合约涨跌幅'])/2
+cm_copy['净值']= (1+cm_copy['合并涨跌幅']).cumprod()
+sm_copy['净值']= (1+sm_copy['合并涨跌幅'] ).cumprod()
+fig, ax = plt.subplots(figsize=(8,4))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.plot(cm_copy['净值'],linewidth=3, c = 'rosybrown', label='当月合约')
+plt.plot(sm_copy['净值'],linewidth=3, c = 'darkred', label='季月合约')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.title('图 4：中证 500 股指期货连续对冲策略净值')
+plt.legend()
+plt.tight_layout()
+plt.savefig('图 4：中证 500 股指期货连续对冲策略净值.png',dpi=800)
+
+"""表 1：当月和季月合约连续对冲策略回测结果"""
+t9 = pd.DataFrame()
+t9.loc['年化收益率','当月合约对冲'] = Performance(cm_copy['净值']).annualized_returns
+t9.loc['年化收益率','季月合约对冲'] = Performance(sm_copy['净值']).annualized_returns
+t9.loc['年化收益率','中证500'] =  Performance(ETF510500['净值']).annualized_returns
+t9.loc['最大回撤','当月合约对冲'] = Performance(cm_copy['净值']).max_drawdown()
+t9.loc['最大回撤','季月合约对冲'] = Performance(sm_copy['净值']).max_drawdown()
+t9.loc['最大回撤','中证500'] = Performance(ETF510500['净值']).max_drawdown()
+t9.loc['波动率','当月合约对冲'] = Performance(cm_copy['净值']).annualized_volatility
+t9.loc['波动率','季月合约对冲'] = Performance(sm_copy['净值']).annualized_volatility
+t9.loc['波动率','中证500'] = Performance(ETF510500['净值']).annualized_volatility
+t9.loc['最终净值','当月合约对冲'] = round(cm_copy['净值'][-1],4)
+t9.loc['最终净值','季月合约对冲'] = round(sm_copy['净值'][-1],4)
+t9.loc['最终净值','中证500'] = round(ETF510500['净值'][-1],4)
+t9
+
+"""图 5：最低贴水策略在不同最低持有天数下的策略净值"""
+p3_cm_dropna['当月合约剩余天数'].fillna(value=0,inplace=True)
+p9_ = pd.concat([p3_cm_dropna,p3_nm,p3_sm,p3_nsm],axis=1)
+p9_ = p9_[['当月合约','当月合约期货价格','当月合约剩余天数','当月合约年化基差','次月合约','次月合约期货价格','次月合约剩余天数','次月合约年化基差','季月合约','季月合约期货价格','季月合约剩余天数','季月合约年化基差','次季月合约','次季月合约期货价格','次季月合约剩余天数','次季月合约年化基差']]
+p9_['当月合约剩余天数'] = p9_['当月合约剩余天数'].fillna(value=0)
+p9_ = p9_.sort_index()
+def count_N_days_net_value(p9_,p3,N=7,ETF=ETF510500['涨跌幅']):
+    p9 = p9_.copy()
+    count = 0
+    start_date = '2018-01-02'
+    end_date = '2023-07-30'
+    for i in range(int(len(p9.index)/N)-1):
+        if pd.to_datetime(start_date) <= pd.to_datetime(end_date):
+            p9.loc[p9.index[count],str(N)+' 开仓信号'] = 1
+            if p9.loc[p9.index[count],'当月合约剩余天数'] < N:
+                # 剔除剩余到期日不足N日的合约
+                max_v = p9.loc[p9.index[count],['次月合约年化基差','季月合约年化基差','次季月合约年化基差']].max()
+            else:
+                max_v = p9.loc[p9.index[count],['当月合约年化基差','次月合约年化基差','季月合约年化基差','次季月合约年化基差']].max()
+            temp = p9.isin([max_v]).any()
+            p9.loc[p9.index[count],'选中合约'] = temp[temp == True].index
+            if p9.loc[p9.index[count],'选中合约'] == '当月合约年化基差':
+                p9.loc[p9.index[count],'选中合约代码'] = p9.loc[p9.index[count],'当月合约']
+            elif p9.loc[p9.index[count],'选中合约'] == '次月合约年化基差':
+                p9.loc[p9.index[count],'选中合约代码'] = p9.loc[p9.index[count],'次月合约']
+            elif p9.loc[p9.index[count],'选中合约'] =='季月合约年化基差':
+                p9.loc[p9.index[count],'选中合约代码'] = p9.loc[p9.index[count],'季月合约']
+            elif p9.loc[p9.index[count],'选中合约'] == '次季月合约年化基差':
+                p9.loc[p9.index[count],'选中合约代码'] = p9.loc[p9.index[count],'次季月合约']
+            count += N
+            start_date = p9.index[count]
+    p9['选中合约代码'].fillna(method='ffill',inplace=True)
+    df = pd.concat([p9,p3],axis=1)
+    for i in range(len(df.index)):
+        df.loc[df.index[i],'选中合约期货价格'] = df.loc[df.index[i],df['选中合约代码'][i]]
+    df['期货端涨跌幅'] = df['选中合约期货价格'] / df['选中合约期货价格'].shift(1) - 1
+    condition = df['选中合约代码'] != df['选中合约代码'].shift(1)
+    df.loc[condition,'调整'] = 1
+    times = round(df['调整'].sum()/(5+7/12),2)
+    for i in range(len(df.index)):
+        if df.loc[df.index[i],'调整'] == 1:
+            df.loc[df.index[i],'期货端涨跌幅'] = df.loc[df.index[i],'选中合约期货价格'] / df.loc[df.index[i-1],df['选中合约代码'][i]] - 1
+    df = pd.concat([df['期货端涨跌幅'] ,ETF],axis=1)
+    df['策略净值'] = (1+(df['涨跌幅'] - df['期货端涨跌幅'])/2).cumprod()
+    return df['策略净值'],times
+# 计算N取1至14日的情况下的净值和年换手次数
+net_value = pd.DataFrame()
+t = pd.DataFrame()
+for i in range(1,15):
+    net_value[i],t.loc['年换手次数',i] = count_N_days_net_value(p9_,p3,N=i)
+    print('N='+str(i) + ' done')
+#     break
+print(t)
+print(net_value)
+
+"""图 5：最低贴水策略在不同最低持有天数下的策略净值"""
+# 可视化
+fig, ax = plt.subplots(figsize=(10,5))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.plot(net_value[1],linewidth=3, c = 'darkred', label='最低持有1日')
+plt.plot(net_value[4],linewidth=3, c = 'rosybrown', label='最低持有4日')
+plt.plot(net_value[6],linewidth=3, c = 'salmon',label='最低持有6日')
+plt.plot(net_value[8],linewidth=3, c = 'coral', label='最低持有8日')
+plt.plot(net_value[10],linewidth=3, c = 'lightsalmon',label='最低持有10日')
+plt.plot(net_value[12],linewidth=3, c = 'sandybrown',label='最低持有12日')
+plt.plot(net_value[14],linewidth=3, c = 'peachpuff',label='最低持有14日')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.title('图 5：最低贴水策略在不同最低持有天数下的策略净值')
+plt.legend()
+plt.tight_layout()
+plt.savefig('图 5：最低贴水策略在不同最低持有天数下的策略净值.png',dpi=800)
+
+"""表 2：最低贴水策略回测结果"""
+t10 = pd.DataFrame()
+for i in range(1,15):
+    t10.loc['年化收益率',i] = Performance(net_value[i]).annualized_returns
+    t10.loc['最大回撤',i] = Performance(net_value[i]).max_drawdown()
+    t10.loc['波动率',i] = Performance(net_value[i]).annualized_volatility
+    t10.loc['最终净值',i] = round(net_value[i][-1],4)
+    t10.loc['年换手次数',i] = round(t.loc['年换手次数',i],2)
+t10
+
+"""图 6：最低贴水策略与连续对冲策略的净值曲线对比图"""
+fig, ax = plt.subplots(figsize=(8,4))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.plot(net_value[9],linewidth=3, c = 'darkred', label='最低贴水策略')
+plt.plot(sm_copy['净值'],linewidth=3, c = 'lightcoral', label='季月合约')
+plt.plot(cm_copy['净值'],linewidth=3, c = 'rosybrown', label='当月合约')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.title('图 6：最低贴水策略与连续对冲策略的净值曲线对比图')
+# plt.grid()
+plt.legend()
+plt.tight_layout()
+plt.savefig('图 6：最低贴水策略与连续对冲策略的净值曲线对比图.png',dpi=800)
+
+"""表3：最低贴水策略与连续对冲策略回测结果对比"""
+t11=pd.DataFrame()
+t11['最低贴水策略']=t10[9]
+t11['当月合约对冲'] = t9['当月合约对冲'] 
+t11['季月合约对冲'] = t9['季月合约对冲'] 
+t11['中证500']=t9['中证500']
+t11.loc['年换手次数','当月合约对冲'] = sgy_cm['调整'].sum()/(5+7/12)
+t11.loc['年换手次数','季月合约对冲'] = sgy_sm['调整'].sum()/(5+7/12)
+t11
+
+"""图 7：持有股票多头的中性策略回测"""
+# 股票000988.SZ[华工科技]作为多头持仓，后复权
+sz000977 = pd.read_excel(r"000988sz华工科技.xlsx",sheet_name='Sheet1',index_col=0, skiprows=2)
+sz000977 = sz000977.iloc[1:,:]
+sz000977['sz000977涨跌幅'] = sz000977['收盘价'] / sz000977['收盘价'].shift(1) - 1
+# sz000977['净值'] = (1+ sz000977['股票涨跌幅']).cumprod()
+# 股票300308.SZ[中际旭创]作为多头持仓，后复权
+sz300308 = pd.read_excel(r"000988sz华工科技.xlsx",sheet_name='Sheet2',index_col=0, skiprows=2)
+sz300308 = sz300308.iloc[1:,:]
+sz300308['sz300308涨跌幅'] = sz300308['收盘价'] / sz300308['收盘价'].shift(1) - 1
+# sz300308['净值'] = (1+ sz300308['股票涨跌幅']).cumprod()
+# 合并涨跌幅
+df_2 = pd.concat([sz000977['sz000977涨跌幅'],sz300308['sz300308涨跌幅']],axis=1)
+df_2['合并涨跌幅'] = (df_2['sz000977涨跌幅'] + df_2['sz300308涨跌幅'])/2
+df_2['合并净值'] = (1+ df_2['合并涨跌幅'] ).cumprod()
+
+# OLS线性回归确定对冲比例
+y = (df_2['合并涨跌幅'].dropna()).astype('float64')
+x = ETF510500['涨跌幅'].dropna().astype('float64')
+x_addcons = sm.add_constant(x)
+model = sm.OLS(endog=y, exog=x_addcons ) # 构建普通最小二乘法的线性回归模型
+result = model.fit() # 生成一个线性回归的结果对象
+coef = result.params.iloc[1] # 取斜率作为对冲数量
+# sz000977['涨跌幅'] = sz000977['股票涨跌幅']*coef
+df_2['涨跌幅'] = df_2['合并涨跌幅'] * coef
+# 计算各策略净值
+sgy,time = count_N_days_net_value(p9_,p3,N=9,ETF=df_2['涨跌幅'])
+cm_copy000977 = pd.concat([sgy_cm['当月合约涨跌幅'], df_2['涨跌幅']],axis=1)
+sm_copy000977 = pd.concat([sgy_sm['季月合约涨跌幅'], df_2['涨跌幅']],axis=1)
+cm_copy000977['合并涨跌幅'] = (cm_copy000977['涨跌幅']-cm_copy000977['当月合约涨跌幅'])/2
+sm_copy000977['合并涨跌幅'] = (sm_copy000977['涨跌幅']-sm_copy000977['季月合约涨跌幅'])/2
+cm_copy000977['净值']= (1+cm_copy000977['合并涨跌幅']).cumprod()
+sm_copy000977['净值']= (1+sm_copy000977['合并涨跌幅'] ).cumprod()
+# 可视化
+fig, ax = plt.subplots(figsize=(10,5))
+ax.spines['right'].set_visible(False)
+ax.spines['top'].set_visible(False)
+plt.plot(cm_copy000977['净值'],linewidth=2, c = 'rosybrown', label='当月合约')
+plt.plot(sm_copy000977['净值'],linewidth=2, c = 'peachpuff', label='季月合约')
+plt.plot(sgy,linewidth=2, c = 'darkred', label='最低贴水策略')
+plt.plot(df_2['合并净值'],linewidth=2, c = 'lightcoral', label='组合多头净值')
+plt.xticks(rotation=30)
+x = DateFormatter('%Y-%m-%d')
+plt.gca().xaxis.set_major_formatter(x)
+plt.title('图 7：持有股票多头的中性策略回测')
+plt.legend()
+plt.tight_layout()
+plt.savefig('图 7：持有股票多头的中性策略回测.png',dpi=800)
+
+"""表4:持有股票多头的中性策略回测结果对比"""
+t101 = pd.DataFrame()
+df = pd.concat([cm_copy000977['净值'],sm_copy000977['净值'],sgy,df_2['合并净值']],axis=1)
+# chage_times = [,,]
+list_code = ['当月合约','季月合约','最低贴水策略','组合多头']
+for i in range(4):
+    t101.loc['年化收益率',list_code[i]] = Performance(df.iloc[:,i]).annualized_returns
+    t101.loc['最大回撤',list_code[i]] = Performance(df.iloc[:,i]).max_drawdown()
+    t101.loc['波动率',list_code[i]] = Performance(df.iloc[:,i]).annualized_volatility
+    t101.loc['夏普比率',list_code[i]] = Performance(df.iloc[:,i]).cal_sharp()
+    t101.loc['最终净值',list_code[i]] = round(df.iloc[:,i][-1],4)
+t101.loc['年换手次数','当月合约'] = sgy_cm['调整'].sum()/(5+7/12)
+t101.loc['年换手次数','季月合约'] = sgy_sm['调整'].sum()/(5+7/12)
+t101.loc['年换手次数','最低贴水策略'] = time
+t101
+
