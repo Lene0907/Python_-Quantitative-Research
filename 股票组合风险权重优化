@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov 18 22:56:35 2021
+
+@author: zw
+"""
+
+#%% 查找上证50指数成分股在2018.1-2023.4期间的月度收益率数据。
+import numpy as np
+import pandas as pd
+import akshare as ak
+sz50_comp = ak.index_stock_cons_csindex(symbol="000016")  #下载sz50成分股
+
+dt_sta ='20180101'  #起始日期
+dt_end ='20230430'   #终止日期  
+num = 0
+# sz50=[]
+for i in sz50_comp['成分券代码']:
+    num=num+1
+    price_new = ak.stock_zh_a_hist(i, period="monthly",start_date=dt_sta, end_date=dt_end, adjust="hfq")  # hfq 指的是后复权的数据
+    price_new['stock_code'] = i 
+    price_new = price_new.set_index('stock_code')    #列转化为行索引
+    if num==1:
+        sz50=price_new
+    else:
+        sz50=pd.concat([sz50,price_new],axis=0)
+    print( 'sz50数据共计', len(sz50_comp.index), '个，目前更新至第',num, '个...')
+
+#%% 1、假设无风险利率为0，以上证50指数为市场组合，利用50只股票2018.1-2022.12期间的数据计算其各自的beta系数，存放在数据框文件beta_sz50中。
+
+# 首先获得上证50指数数据
+index_sz50 = ak.index_zh_a_hist(symbol="000016", period="monthly", start_date=dt_sta, end_date=dt_end)
+index_sz50 = index_sz50[['日期','涨跌幅']]
+index_sz50.columns = ['date','rets_index']
+index_sz50['rets_index'] = index_sz50['rets_index']/100	
+import datetime as dt
+index_sz50['date_real'] = pd.to_datetime(index_sz50['date']).dt.strftime('%Y-%m')  # 只保留年和月
+
+# 数据预处理
+sz50 = sz50[['日期','涨跌幅']]
+sz50.columns = ['date','rets']
+sz50['rets'] = sz50['rets']/100	
+sz50.loc[sz50['rets']>1,'rets'] = 0     # 异常涨幅处理
+sz50['date_real'] = pd.to_datetime(sz50['date']).dt.strftime('%Y-%m')  # 只保留年和月
+sz50 = sz50.reset_index()
+sz50 = pd.merge(sz50, index_sz50,how='outer',on='date_real')  #合并指数数据
+
+sz50_obs = sz50[sz50['date_real']<'2023-01']
+sz50_test = sz50[sz50['date_real']>='2023-01']
+
+# 下面准备做回归
+import statsmodels.api as sm #导入StatsModels的子模块api
+beta_sz50=pd.DataFrame([],index=sz50_obs['stock_code'].unique(),columns=['beta','rets'])
+for i in beta_sz50.index.unique():
+    temp = sz50_obs[sz50_obs['stock_code']==i]
+    if len(temp)>20:
+        y = temp['rets']
+        x = temp['rets_index']
+        x_addcons=sm.add_constant(x) #对自变量的样本值添加一列常数值
+        
+        models = sm.OLS(endog=y,exog=x_addcons) #构建ols的线性回归模型
+        results = models.fit() #拟合线性回归模型
+        if results.rsquared_adj > 0:#回归要有意义
+            beta_sz50.loc[i,'beta'] = results.params[1]
+            beta_sz50.loc[i,'rets'] = y.mean()
+
+# 整理得到的beta系数：
+beta_sz50.dropna(inplace=True)     
+print('上证50成分股的贝塔系数计算完毕，得到有效值样本数： ',len(beta_sz50))
+
+#%% 2、利用这50只股票构建组合port，请计算一个最优的权重w，使得组合的期望月收益达到1%，
+同时使得组合的系统性风险尽可能小（即组合的beta值尽可能小，每只股票权重不能超过10%，也不能卖空）。
+
+import scipy.optimize as sco  #导入Scipy的子模块optimize
+
+def risk_beta(w):
+    w=np.array(w)
+    stockRisk_beta=np.sum(beta_sz50['beta']*w)
+    return np.array(stockRisk_beta)
+
+cons=({'type':'eq','fun':lambda w: np.sum(w)-1},{'type':'eq','fun':lambda w: np.sum(w*beta_sz50['rets'])-0.01}) #约束函数
+bnds=[(0,0.1) for i in range(len(beta_sz50)) ] #参数的取值范围
+result=sco.minimize(risk_beta,[0.1 for i in range(len(beta_sz50))],method='SLSQP',bounds=bnds,constraints=cons) #最小值求解
+w=result['x'] 
+print('符合要求的最优权重为：\n',w) #输出最优权重参数
+
+#%% 3、用上一问的结论，计算上述股票组合的历史月收益率mu_port和标准差delta_port，然后假设该组合未来的股价服从几何布朗运动，
+模拟其未来4个月（2023.1-2023.4）的股价走势10000次，并将走势可视化。
+
+# 先做数据整理
+weight = pd.DataFrame(w,index=beta_sz50.index,columns=['weight'])
+weight = weight[weight['weight'] > 0 ]
+num=0
+for i in weight.index.unique():
+    num=num+1
+    temp = sz50[sz50['stock_code'] == i][['date_real','rets']]
+    temp = temp.rename(columns={'rets':i})
+    if num==1:
+        port = temp
+    else:
+        port = pd.merge(port, temp, how='outer', left_on='date_real', right_on='date_real')
+    
+port = port.fillna(0)
+port.set_index('date_real',inplace=True)
+# 计算均值和方差
+rets_port = np.dot(port[port.index<'2023-01'], weight)  #组合的收益率序列
+mu_port = rets_port.mean()*12  #年化收益率
+sigma_port = rets_port.std()*np.sqrt(12) #年化标准差
+print('投资组合的历史月收益率计算完毕。\n预期年化收益率为:',round(mu_port,4))
+print('投资组合的标准差计算完毕。\n年化波动率为:',round(sigma_port,4))
+
+# 模拟其未来4个月（2023.1-2023.4）的股价走势10000次
+import numpy.random as npr #导入NumPy的子模块random
+dates = pd.date_range(start='2022-12-01', end='2023-04-30', freq='MS').strftime('%Y-%m') #生成2023.1至2023.4年的月份
+N=len(dates) #将N赋值为是date的长度
+I=10000 #模拟的路径数
+dt=1.0/12 #单位时间的区间长度
+mu=np.array(mu_port) #将数据结构调整为数组
+sigma=np.array(sigma_port) #将数据结构调整为数组
+s_GBM=np.zeros((N,I)) #建立存放服从几何布朗运动的未来股价的初始数组
+s_GBM[0]=1 #初始股价
+
+for t in range(1,N):
+    epsilon=npr.standard_normal(I)
+    s_GBM[t]=s_GBM[t-1]*np.exp((mu-0.5*sigma**2)*dt+sigma*epsilon*np.sqrt(dt))
+s_gbm=pd.DataFrame(s_GBM,index=dates) #将模拟的数值转化为带有时间索引的数据框
+print('\n服从几何布朗运动的股价模拟计算完毕，下面进行可视化处理！\n')
+
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['SimHei']  #设置中文黑体显示
+plt.rcParams['axes.unicode_minus'] = False    #设置符号正确显示
+
+plt.figure(figsize=(8,6))
+plt.plot(s_gbm)
+plt.xlabel('日期',fontsize =13)
+plt.ylabel('组合股价',fontsize =13,rotation=90)
+plt.xticks(fontsize=13,rotation=30)
+plt.yticks(fontsize=13)
+plt.title('服从几何布朗运动的股价模拟全部路径（2022.12-2023.4）',fontsize=13)
+plt.grid('True')
+plt.show()
+
+print('未来4个月股票组合的几何布朗运动股价模拟完毕。')
+
+#%% 4、根据上一问中预测的股价走势，计算该组合预测涨幅的平均值，得到一条预测股价曲线price_port_pre；
+然后利用2023.1-2023.4的真实交易数据计算该组合的真实股价曲线price_port；
+最后查找上证50指数同一时间的净值曲线；并比较三个曲线的夏普比率。
+
+# 预测股价曲线
+s_gbm_rets = s_gbm.pct_change().mean(1)
+price_port_pre = s_gbm_rets+1
+price_port_pre[0] = 1
+price_port_pre= price_port_pre.cumprod()
+mu_price_port_pre = s_gbm_rets.dropna().mean()*12
+sigma_price_port_pre = s_gbm_rets.dropna().std()*np.sqrt(12) #年化标准差
+
+# 真实股价曲线
+rets_port2 = np.dot(port[port.index>='2022-12'], weight)  #组合的收益率序列
+rets_port2 = rets_port2+1
+rets_port2[0] = 1
+price_port = rets_port2.cumprod()
+price_port = pd.Series(price_port)
+mu_price_port = price_port.pct_change().dropna().mean()*12
+sigma_price_port = price_port.pct_change().dropna().std()*np.sqrt(12) #年化标准差
+
+
+# 上证50指数
+index_sz50_test = index_sz50[index_sz50['date_real']>='2022-12']
+index_sz50_test['netvalue'] = index_sz50_test['rets_index']+1
+index_sz50_test['netvalue'].iloc[0] = 1
+index_sz50_test['netvalue'] = index_sz50_test['netvalue'].cumprod()
+mu_index_sz50_test = index_sz50_test['netvalue'].pct_change().dropna().mean()*12
+sigma_index_sz50_test = index_sz50_test['netvalue'].pct_change().dropna().std()*np.sqrt(12) #年化标准差
+
+
+plt.figure(figsize=(8,6))
+plt.plot(index_sz50_test['date_real'],index_sz50_test['netvalue'],'g',label=u'上证50')
+plt.plot(price_port,'b',label=u'真实组合')
+plt.plot(price_port_pre,'r',label=u'模拟组合')
+plt.xlabel('日期',fontsize =13)
+plt.ylabel('净值',fontsize =13,rotation=90)
+plt.xticks(fontsize=13,rotation=30)
+plt.yticks(fontsize=13)
+plt.title('模拟股价与真实股价、指数的比较（2022.12-2023.4）',fontsize=13)
+plt.legend(loc=0,fontsize=13)
+plt.grid('True')
+plt.show()
+
+#########################################################3
+def SR(Rp,Rf,Vp):
+    '''计算夏普比率（Sharpe Ratio）
+    Rp：表示投资组合的年化收益率
+    Rf：表示年化无风险利率
+    Vp：表示投资组合的年化收益波动率'''
+    return (Rp-Rf)/Vp
+
+print('模拟组合的夏普比率为：\n',SR(mu_price_port_pre,0.03,sigma_price_port_pre))
+print('真实组合的夏普比率为：\n',SR(mu_price_port,0.03,sigma_price_port))
+print('上证50的夏普比率为：\n',SR(mu_index_sz50_test,0.03,sigma_index_sz50_test))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
