@@ -8,7 +8,7 @@ import matplotlib.ticker as ticker
 import statsmodels.api as sm #导入StatsModels的子模块api
 import rqdatac as rq
 from rqdatac import *
-rq.init('license','grrTNo3dkZWxmjibcJABj8wmoUNJ89n_seBVWr4d-_yB3JA07t616Yv9ZHjHMlOTm73t0519OK_Daivudx8Qdy3G5McI1FH7ple9Iay7zEllwtY8VUyQgP18KKEXJdI3_jltVHzMHscWXrR7J0L2aNf1pmQUzTNjlAcqHKgVktk=PVnor5Ki58fMcZO7JtP5CaRVdqy1ppGXZC6pRzLYYDlfEJcHb59VBF7UHXAxaKM-li40ge27Ay15ZOKmCidH6f-5QJlhn6PDL1iUhrmY7-HfOmxUjsvaYXQ_9eBCRVo5UpPrNy7qHR7-9g72A9tgZrGJYGPfWNtywPD9Y1g-oKg=')
+rq.init('license','')
 rq.user.get_quota()
 # 注意⚠️ 账号可能过期，使得无法获取数据进而出错
 """函数定义"""
